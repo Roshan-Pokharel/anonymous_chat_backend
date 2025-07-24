@@ -1,4 +1,3 @@
-// server.js
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
@@ -7,27 +6,20 @@ const cors = require("cors");
 const app = express();
 app.use(cors());
 
-// HTTP server for Socket.IO
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: "*", // Change to your Vercel URL in production
+    origin: "*", // Or use your Vercel domain
     methods: ["GET", "POST"],
   },
 });
 
-// Health check route
-app.get("/", (req, res) => {
-  res.send("Socket.IO server is running");
-});
-
-// Users and chat state
-let users = {}; // socket.id -> userInfo
-let chatHistory = {}; // room -> [{ msg, timestamp }]
+const users = {};
+const chatHistory = {}; // { roomName: [ { msg, timestamp } ] }
 
 const FIVE_MINUTES = 5 * 60 * 1000;
 
-// Cleanup old messages every 1 min
+// Periodically clear out old messages
 setInterval(() => {
   const now = Date.now();
   for (const room in chatHistory) {
@@ -37,60 +29,65 @@ setInterval(() => {
   }
 }, 60 * 1000);
 
-// Socket.IO logic
 io.on("connection", (socket) => {
-  console.log("✅ New user connected:", socket.id);
+  console.log("🟢 User connected:", socket.id);
 
-  // Handle user info
   socket.on("user info", ({ nickname, gender, age }) => {
-    users[socket.id] = { id: socket.id, name: nickname, gender, age };
+    users[socket.id] = {
+      id: socket.id,
+      name: nickname,
+      gender,
+      age,
+    };
     io.emit("user list", Object.values(users));
   });
 
-  // Handle room join and send history
-  socket.on("join room", (room) => {
-    socket.join(room);
-    const history = chatHistory[room] || [];
-    socket.emit(
-      "room history",
-      history.map((e) => e.msg)
-    );
+  socket.on("join room", (roomName) => {
+    socket.join(roomName);
+
+    // Send last messages from this room
+    if (chatHistory[roomName]) {
+      const history = chatHistory[roomName].map((entry) => entry.msg);
+      socket.emit("room history", history);
+    }
   });
 
-  // Handle messages
   socket.on("chat message", ({ room, text, to }) => {
-    const sender = users[socket.id];
-    if (!sender) return;
+    const user = users[socket.id];
+    if (!user) return;
 
     const msg = {
       id: socket.id,
-      name: sender.name,
-      gender: sender.gender,
-      age: sender.age,
+      name: user.name,
+      gender: user.gender,
+      age: user.age,
       text,
       room,
       to: to || null,
     };
 
-    // Save to history
+    // Save to chat history
     if (!chatHistory[room]) {
       chatHistory[room] = [];
     }
     chatHistory[room].push({ msg, timestamp: Date.now() });
 
+    // Broadcast to the room
     io.to(room).emit("chat message", msg);
   });
 
-  // Handle disconnect
   socket.on("disconnect", () => {
-    console.log("❌ Disconnected:", socket.id);
+    console.log("🔴 User disconnected:", socket.id);
     delete users[socket.id];
     io.emit("user list", Object.values(users));
   });
 });
 
-// Start server
+app.get("/", (req, res) => {
+  res.send("✅ Socket.IO chat backend is running");
+});
+
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`🚀 Server listening on port ${PORT}`);
+  console.log(`🚀 Server is running on port ${PORT}`);
 });
