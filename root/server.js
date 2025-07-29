@@ -4,22 +4,21 @@ const { Server } = require("socket.io");
 const cors = require("cors");
 
 const app = express();
-// Note: While the socket.io cors config is what matters most,
-// it's good practice to have the express one configured as well.
+// It's good practice to have the express cors middleware as well.
 app.use(cors({ origin: "https://anonymous-chat-frontend-gray.vercel.app" }));
 
 const server = http.createServer(app);
 
-// --- SECURE CORS CONFIGURATION ---
+// --- SECURE CORS CONFIGURATION for Socket.IO ---
 const io = new Server(server, {
   cors: {
-    // This is the crucial part. Only your frontend can connect.
+    // This is the crucial part. Only your specified frontend can connect.
     origin: "https://anonymous-chat-frontend-gray.vercel.app",
     methods: ["GET", "POST"],
   },
 });
 
-// --- PREDEFINED BACKGROUNDS ---
+// --- PREDEFINED BACKGROUNDS (Server-side) ---
 const predefinedBackgrounds = [
   "https://images.unsplash.com/photo-1506748686214-e9df14d4d9d0?q=80&w=1374&auto=format&fit=crop",
   "https://images.unsplash.com/photo-1501854140801-50d01698950b?q=80&w=1575&auto=format&fit=crop",
@@ -28,33 +27,34 @@ const predefinedBackgrounds = [
 ];
 
 // --- STATE MANAGEMENT ---
-const users = {}; // Stores user data { socket.id: { id, name, gender, age } }
-const chatHistory = {}; // { roomName: [ { msg, timestamp } ] }
-const roomSettings = {}; // { roomName: { backgroundUrl: '...' } }
-const messageSenders = {}; // { messageId: senderSocketId }
+const users = {}; // Stores user data: { socket.id: { id, name, gender, age } }
+const chatHistory = {}; // Stores message history: { roomName: [ { msg, timestamp } ] }
+const roomSettings = {}; // Stores room settings: { roomName: { backgroundUrl: '...' } }
+const messageSenders = {}; // Tracks message sender for read receipts: { messageId: senderSocketId }
 
-// --- RATE LIMITING ---
+// --- RATE LIMITING CONSTANTS ---
 const userMessageTimestamps = {}; // { socketId: [timestamp1, timestamp2, ...] }
 const RATE_LIMIT_COUNT = 5; // Max 5 messages
 const RATE_LIMIT_SECONDS = 5; // per 5 seconds
 
-const FIVE_MINUTES = 5 * 60 * 1000;
+const FIVE_MINUTES_IN_MS = 5 * 60 * 1000;
 
-// Periodically clear out old messages to prevent memory leaks
+// Periodically clear out old messages from history to prevent memory leaks
 setInterval(() => {
   const now = Date.now();
   for (const room in chatHistory) {
     chatHistory[room] = chatHistory[room].filter(
-      (entry) => now - entry.timestamp < FIVE_MINUTES
+      (entry) => now - entry.timestamp < FIVE_MINUTES_IN_MS
     );
   }
-}, 60 * 1000); // Run every minute
+}, 60 * 1000); // Run this check every minute
 
 io.on("connection", (socket) => {
   console.log("🟢 User connected:", socket.id);
   // Initialize rate limiting array for the new user
   userMessageTimestamps[socket.id] = [];
 
+  // Listen for user profile information
   socket.on("user info", ({ nickname, gender, age }) => {
     // Basic validation for user info
     if (
@@ -62,7 +62,7 @@ io.on("connection", (socket) => {
       nickname.trim().length === 0 ||
       nickname.length > 20
     ) {
-      return; // Invalid nickname
+      return; // Ignore invalid nickname
     }
     users[socket.id] = {
       id: socket.id,
@@ -74,6 +74,7 @@ io.on("connection", (socket) => {
     io.emit("user list", Object.values(users));
   });
 
+  // Listen for a user joining a room
   socket.on("join room", (roomName) => {
     socket.join(roomName);
 
@@ -91,6 +92,7 @@ io.on("connection", (socket) => {
     }
   });
 
+  // Listen for incoming chat messages
   socket.on("chat message", ({ room, text }) => {
     const user = users[socket.id];
     if (!user) return; // Ignore messages from users who haven't set their info
@@ -124,11 +126,12 @@ io.on("connection", (socket) => {
     const messageId = `${Date.now()}-${socket.id}`; // Create a unique message ID
     const msg = {
       id: socket.id,
+      to: room.replace(socket.id, "").replace("-", ""), // For private messages
       messageId: messageId,
       name: user.name,
       gender: user.gender,
       age: user.age,
-      text: text.trim(), // Send the trimmed text
+      text: text.trim(),
       room,
       status: "sent", // Default status for read receipts
     };
@@ -145,6 +148,7 @@ io.on("connection", (socket) => {
     io.to(room).emit("chat message", msg);
   });
 
+  // Listen for when a message is read in a private chat
   socket.on("message read", ({ room, messageId }) => {
     const senderSocketId = messageSenders[messageId];
     // If we find the original sender, emit an event back to *only* them
@@ -153,12 +157,12 @@ io.on("connection", (socket) => {
     }
   });
 
-  // --- UPDATED: Set background from predefined list ---
+  // Listen for background change requests
   socket.on("set background", ({ room, backgroundId }) => {
     // Validate the received ID
     const id = parseInt(backgroundId, 10);
     if (isNaN(id) || id < 0 || id >= predefinedBackgrounds.length) {
-      return; // Invalid ID
+      return; // Invalid ID, do nothing
     }
 
     const backgroundUrl = predefinedBackgrounds[id];
@@ -171,6 +175,7 @@ io.on("connection", (socket) => {
     io.to(room).emit("background updated", { room, backgroundUrl });
   });
 
+  // Listen for typing events
   socket.on("typing", ({ room }) => {
     const user = users[socket.id];
     if (user) {
@@ -178,6 +183,7 @@ io.on("connection", (socket) => {
     }
   });
 
+  // Listen for stop typing events
   socket.on("stop typing", ({ room }) => {
     const user = users[socket.id];
     if (user) {
@@ -185,17 +191,20 @@ io.on("connection", (socket) => {
     }
   });
 
+  // Handle user disconnection
   socket.on("disconnect", () => {
     console.log("🔴 User disconnected:", socket.id);
     delete users[socket.id];
     // Clean up rate limit data for the disconnected user
     delete userMessageTimestamps[socket.id];
+    // Broadcast the new user list
     io.emit("user list", Object.values(users));
   });
 });
 
+// A simple root route to confirm the server is running
 app.get("/", (req, res) => {
-  res.send("✅ Socket.IO chat backend is running");
+  res.send("✅ Anonymous Chat Backend is running smoothly.");
 });
 
 const PORT = process.env.PORT || 3000;
