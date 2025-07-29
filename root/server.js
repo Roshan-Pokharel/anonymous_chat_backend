@@ -4,30 +4,35 @@ const { Server } = require("socket.io");
 const cors = require("cors");
 
 const app = express();
-app.use(cors());
+// Note: While the socket.io cors config is what matters most,
+// it's good practice to have the express one configured as well.
+app.use(cors({ origin: "https://anonymous-chat-frontend-gray.vercel.app" }));
 
 const server = http.createServer(app);
+
+// --- SECURE CORS CONFIGURATION ---
 const io = new Server(server, {
   cors: {
-    origin: "*", // Or use your Vercel domain
+    // This is the crucial part. Only your frontend can connect.
+    origin: "https://anonymous-chat-frontend-gray.vercel.app",
     methods: ["GET", "POST"],
   },
 });
 
-const users = {};
+// --- STATE MANAGEMENT ---
+const users = {}; // Stores user data { socket.id: { id, name, gender, age } }
 const chatHistory = {}; // { roomName: [ { msg, timestamp } ] }
-
-// --- ✨ NEW: Room settings, read receipt tracking, and rate limiting ---
 const roomSettings = {}; // { roomName: { backgroundUrl: '...' } }
 const messageSenders = {}; // { messageId: senderSocketId }
+
+// --- RATE LIMITING ---
 const userMessageTimestamps = {}; // { socketId: [timestamp1, timestamp2, ...] }
 const RATE_LIMIT_COUNT = 5; // Max 5 messages
 const RATE_LIMIT_SECONDS = 5; // per 5 seconds
-// ---
 
 const FIVE_MINUTES = 5 * 60 * 1000;
 
-// Periodically clear out old messages
+// Periodically clear out old messages to prevent memory leaks
 setInterval(() => {
   const now = Date.now();
   for (const room in chatHistory) {
@@ -35,7 +40,7 @@ setInterval(() => {
       (entry) => now - entry.timestamp < FIVE_MINUTES
     );
   }
-}, 60 * 1000);
+}, 60 * 1000); // Run every minute
 
 io.on("connection", (socket) => {
   console.log("🟢 User connected:", socket.id);
@@ -43,38 +48,54 @@ io.on("connection", (socket) => {
   userMessageTimestamps[socket.id] = [];
 
   socket.on("user info", ({ nickname, gender, age }) => {
+    // Basic validation for user info
+    if (
+      typeof nickname !== "string" ||
+      nickname.trim().length === 0 ||
+      nickname.length > 20
+    ) {
+      return; // Invalid nickname
+    }
     users[socket.id] = {
       id: socket.id,
-      name: nickname,
+      name: nickname.trim(),
       gender,
       age,
     };
+    // Broadcast the updated user list to all clients
     io.emit("user list", Object.values(users));
   });
 
   socket.on("join room", (roomName) => {
     socket.join(roomName);
 
-    // Send last messages from this room
+    // Send recent message history for this room to the joining user
     if (chatHistory[roomName]) {
       const history = chatHistory[roomName].map((entry) => entry.msg);
       socket.emit("room history", history);
     }
-    // --- ✨ NEW: Send room background if it exists ---
+    // Send room-specific settings like the background image
     if (roomSettings[roomName] && roomSettings[roomName].backgroundUrl) {
       socket.emit("background updated", {
         room: roomName,
         backgroundUrl: roomSettings[roomName].backgroundUrl,
       });
     }
-    // ---
   });
 
-  socket.on("chat message", ({ room, text, to }) => {
+  socket.on("chat message", ({ room, text }) => {
     const user = users[socket.id];
-    if (!user) return;
+    if (!user) return; // Ignore messages from users who haven't set their info
 
-    // --- ✨ NEW: Rate Limiting Logic ---
+    // --- Server-Side Validation & Rate Limiting ---
+    if (
+      typeof text !== "string" ||
+      text.trim().length === 0 ||
+      text.length > 500
+    ) {
+      return; // Ignore invalid or empty messages
+    }
+
     const now = Date.now();
     // Clear timestamps older than the rate limit window
     userMessageTimestamps[socket.id] = userMessageTimestamps[socket.id].filter(
@@ -95,17 +116,16 @@ io.on("connection", (socket) => {
     const messageId = `${Date.now()}-${socket.id}`; // Create a unique message ID
     const msg = {
       id: socket.id,
-      messageId: messageId, // Add ID to message object
+      messageId: messageId,
       name: user.name,
       gender: user.gender,
       age: user.age,
-      text,
+      text: text.trim(), // Send the trimmed text
       room,
-      to: to || null,
       status: "sent", // Default status for read receipts
     };
 
-    // ✨ NEW: Track who sent which message for read receipts
+    // Track who sent which message for read receipts
     messageSenders[messageId] = socket.id;
 
     if (!chatHistory[room]) {
@@ -113,21 +133,29 @@ io.on("connection", (socket) => {
     }
     chatHistory[room].push({ msg, timestamp: Date.now() });
 
+    // Send the message to everyone in the room
     io.to(room).emit("chat message", msg);
   });
 
-  // --- ✨ NEW: Read Receipts Listener ---
   socket.on("message read", ({ room, messageId }) => {
     const senderSocketId = messageSenders[messageId];
-    // If we find the original sender, emit an event back to only them
+    // If we find the original sender, emit an event back to *only* them
     if (senderSocketId) {
       io.to(senderSocketId).emit("message was read", { room, messageId });
     }
   });
-  // ---
 
-  // --- ✨ NEW: Set Background Image Listener ---
   socket.on("set background", ({ room, backgroundUrl }) => {
+    // Basic URL validation
+    if (
+      typeof backgroundUrl !== "string" ||
+      !(
+        backgroundUrl.startsWith("http://") ||
+        backgroundUrl.startsWith("https://")
+      )
+    ) {
+      return;
+    }
     if (!roomSettings[room]) {
       roomSettings[room] = {};
     }
@@ -135,7 +163,6 @@ io.on("connection", (socket) => {
     // Notify all users in the room about the new background
     io.to(room).emit("background updated", { room, backgroundUrl });
   });
-  // ---
 
   socket.on("typing", ({ room }) => {
     const user = users[socket.id];
