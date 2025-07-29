@@ -17,6 +17,14 @@ const io = new Server(server, {
 const users = {};
 const chatHistory = {}; // { roomName: [ { msg, timestamp } ] }
 
+// --- ✨ NEW: Room settings, read receipt tracking, and rate limiting ---
+const roomSettings = {}; // { roomName: { backgroundUrl: '...' } }
+const messageSenders = {}; // { messageId: senderSocketId }
+const userMessageTimestamps = {}; // { socketId: [timestamp1, timestamp2, ...] }
+const RATE_LIMIT_COUNT = 5; // Max 5 messages
+const RATE_LIMIT_SECONDS = 5; // per 5 seconds
+// ---
+
 const FIVE_MINUTES = 5 * 60 * 1000;
 
 // Periodically clear out old messages
@@ -31,6 +39,8 @@ setInterval(() => {
 
 io.on("connection", (socket) => {
   console.log("🟢 User connected:", socket.id);
+  // Initialize rate limiting array for the new user
+  userMessageTimestamps[socket.id] = [];
 
   socket.on("user info", ({ nickname, gender, age }) => {
     users[socket.id] = {
@@ -50,33 +60,83 @@ io.on("connection", (socket) => {
       const history = chatHistory[roomName].map((entry) => entry.msg);
       socket.emit("room history", history);
     }
+    // --- ✨ NEW: Send room background if it exists ---
+    if (roomSettings[roomName] && roomSettings[roomName].backgroundUrl) {
+      socket.emit("background updated", {
+        room: roomName,
+        backgroundUrl: roomSettings[roomName].backgroundUrl,
+      });
+    }
+    // ---
   });
 
   socket.on("chat message", ({ room, text, to }) => {
     const user = users[socket.id];
     if (!user) return;
 
+    // --- ✨ NEW: Rate Limiting Logic ---
+    const now = Date.now();
+    // Clear timestamps older than the rate limit window
+    userMessageTimestamps[socket.id] = userMessageTimestamps[socket.id].filter(
+      (timestamp) => now - timestamp < RATE_LIMIT_SECONDS * 1000
+    );
+    // Check if the user has exceeded the message limit
+    if (userMessageTimestamps[socket.id].length >= RATE_LIMIT_COUNT) {
+      socket.emit(
+        "rate limit",
+        "You are sending messages too quickly. Please slow down."
+      );
+      return; // Stop message processing
+    }
+    // Add the current message timestamp
+    userMessageTimestamps[socket.id].push(now);
+    // ---
+
+    const messageId = `${Date.now()}-${socket.id}`; // Create a unique message ID
     const msg = {
       id: socket.id,
+      messageId: messageId, // Add ID to message object
       name: user.name,
       gender: user.gender,
       age: user.age,
       text,
       room,
       to: to || null,
+      status: "sent", // Default status for read receipts
     };
 
-    // Save to chat history
+    // ✨ NEW: Track who sent which message for read receipts
+    messageSenders[messageId] = socket.id;
+
     if (!chatHistory[room]) {
       chatHistory[room] = [];
     }
     chatHistory[room].push({ msg, timestamp: Date.now() });
 
-    // Broadcast to the room
     io.to(room).emit("chat message", msg);
   });
 
-  // --- ✨ NEW FEATURE: TYPING INDICATOR ---
+  // --- ✨ NEW: Read Receipts Listener ---
+  socket.on("message read", ({ room, messageId }) => {
+    const senderSocketId = messageSenders[messageId];
+    // If we find the original sender, emit an event back to only them
+    if (senderSocketId) {
+      io.to(senderSocketId).emit("message was read", { room, messageId });
+    }
+  });
+  // ---
+
+  // --- ✨ NEW: Set Background Image Listener ---
+  socket.on("set background", ({ room, backgroundUrl }) => {
+    if (!roomSettings[room]) {
+      roomSettings[room] = {};
+    }
+    roomSettings[room].backgroundUrl = backgroundUrl;
+    // Notify all users in the room about the new background
+    io.to(room).emit("background updated", { room, backgroundUrl });
+  });
+  // ---
+
   socket.on("typing", ({ room }) => {
     const user = users[socket.id];
     if (user) {
@@ -90,11 +150,12 @@ io.on("connection", (socket) => {
       socket.to(room).emit("stop typing", { name: user.name, room });
     }
   });
-  // --- END OF NEW FEATURE ---
 
   socket.on("disconnect", () => {
     console.log("🔴 User disconnected:", socket.id);
     delete users[socket.id];
+    // Clean up rate limit data for the disconnected user
+    delete userMessageTimestamps[socket.id];
     io.emit("user list", Object.values(users));
   });
 });
