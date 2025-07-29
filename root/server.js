@@ -18,18 +18,10 @@ const io = new Server(server, {
   },
 });
 
-// --- PREDEFINED BACKGROUNDS (Server-side) ---
-const predefinedBackgrounds = [
-  "https://images.unsplash.com/photo-1506748686214-e9df14d4d9d0?q=80&w=1374&auto=format&fit=crop",
-  "https://images.unsplash.com/photo-1501854140801-50d01698950b?q=80&w=1575&auto=format&fit=crop",
-  "https://images.unsplash.com/photo-1470770841072-f978cf4d019e?q=80&w=1470&auto=format&fit=crop",
-  "https://images.unsplash.com/photo-1511497584788-876760111969?q=80&w=1332&auto=format&fit=crop",
-];
-
 // --- STATE MANAGEMENT ---
 const users = {}; // Stores user data: { socket.id: { id, name, gender, age } }
 const chatHistory = {}; // Stores message history: { roomName: [ { msg, timestamp } ] }
-const roomSettings = {}; // Stores room settings: { roomName: { backgroundUrl: '...' } }
+// roomSettings is no longer needed as backgrounds are client-side.
 const messageSenders = {}; // Tracks message sender for read receipts: { messageId: senderSocketId }
 
 // --- RATE LIMITING CONSTANTS ---
@@ -83,13 +75,7 @@ io.on("connection", (socket) => {
       const history = chatHistory[roomName].map((entry) => entry.msg);
       socket.emit("room history", history);
     }
-    // Send room-specific settings like the background image
-    if (roomSettings[roomName] && roomSettings[roomName].backgroundUrl) {
-      socket.emit("background updated", {
-        room: roomName,
-        backgroundUrl: roomSettings[roomName].backgroundUrl,
-      });
-    }
+    // Background settings are no longer sent from the server.
   });
 
   // Listen for incoming chat messages
@@ -157,23 +143,7 @@ io.on("connection", (socket) => {
     }
   });
 
-  // Listen for background change requests
-  socket.on("set background", ({ room, backgroundId }) => {
-    // Validate the received ID
-    const id = parseInt(backgroundId, 10);
-    if (isNaN(id) || id < 0 || id >= predefinedBackgrounds.length) {
-      return; // Invalid ID, do nothing
-    }
-
-    const backgroundUrl = predefinedBackgrounds[id];
-
-    if (!roomSettings[room]) {
-      roomSettings[room] = {};
-    }
-    roomSettings[room].backgroundUrl = backgroundUrl;
-    // Notify all users in the room about the new background
-    io.to(room).emit("background updated", { room, backgroundUrl });
-  });
+  // The 'set background' event listener is removed from the server.
 
   // Listen for typing events
   socket.on("typing", ({ room }) => {
