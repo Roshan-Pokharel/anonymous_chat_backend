@@ -76,6 +76,22 @@ io.on("connection", (socket) => {
     io.to(room).emit("chat message", msg);
   });
 
+  // --- ✨ NEW FEATURE: TYPING INDICATOR ---
+  socket.on("typing", ({ room }) => {
+    const user = users[socket.id];
+    if (user) {
+      socket.to(room).emit("typing", { name: user.name, room });
+    }
+  });
+
+  socket.on("stop typing", ({ room }) => {
+    const user = users[socket.id];
+    if (user) {
+      socket.to(room).emit("stop typing", { name: user.name, room });
+    }
+  });
+  // --- END OF NEW FEATURE ---
+
   socket.on("disconnect", () => {
     console.log("🔴 User disconnected:", socket.id);
     delete users[socket.id];
