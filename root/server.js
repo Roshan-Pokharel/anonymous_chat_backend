@@ -19,6 +19,14 @@ const io = new Server(server, {
   },
 });
 
+// --- PREDEFINED BACKGROUNDS ---
+const predefinedBackgrounds = [
+  "https://images.unsplash.com/photo-1506748686214-e9df14d4d9d0?q=80&w=1374&auto=format&fit=crop",
+  "https://images.unsplash.com/photo-1501854140801-50d01698950b?q=80&w=1575&auto=format&fit=crop",
+  "https://images.unsplash.com/photo-1470770841072-f978cf4d019e?q=80&w=1470&auto=format&fit=crop",
+  "https://images.unsplash.com/photo-1511497584788-876760111969?q=80&w=1332&auto=format&fit=crop",
+];
+
 // --- STATE MANAGEMENT ---
 const users = {}; // Stores user data { socket.id: { id, name, gender, age } }
 const chatHistory = {}; // { roomName: [ { msg, timestamp } ] }
@@ -145,17 +153,16 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("set background", ({ room, backgroundUrl }) => {
-    // Basic URL validation
-    if (
-      typeof backgroundUrl !== "string" ||
-      !(
-        backgroundUrl.startsWith("http://") ||
-        backgroundUrl.startsWith("https://")
-      )
-    ) {
-      return;
+  // --- UPDATED: Set background from predefined list ---
+  socket.on("set background", ({ room, backgroundId }) => {
+    // Validate the received ID
+    const id = parseInt(backgroundId, 10);
+    if (isNaN(id) || id < 0 || id >= predefinedBackgrounds.length) {
+      return; // Invalid ID
     }
+
+    const backgroundUrl = predefinedBackgrounds[id];
+
     if (!roomSettings[room]) {
       roomSettings[room] = {};
     }
