@@ -131,6 +131,10 @@ function handlePlayerLeave(socketId, roomId) {
 
 io.on("connection", (socket) => {
   console.log("🟢 User connected:", socket.id);
+
+  // FIX: Automatically join all connecting clients to the public room
+  socket.join("public");
+
   userMessageTimestamps[socket.id] = [];
 
   socket.emit("user list", Object.values(users));
@@ -179,31 +183,23 @@ io.on("connection", (socket) => {
 
     const gameState = gameStates[room];
 
-    // --- MODIFIED GAME LOGIC ---
-    // If the message is in an active game room, treat it as a potential guess
     if (gameState && gameState.isRoundActive) {
-      // If the sender is the drawer, block them from chatting.
       if (socket.id === gameState.drawer.id) {
         socket.emit("rate limit", "You cannot chat while drawing.");
         return;
       }
-
-      // If the sender is a guesser, check their answer
       if (text.trim().toLowerCase() === gameState.word.toLowerCase()) {
         clearTimeout(gameState.roundTimer);
-
         const drawerSocketId = gameState.drawer.id;
         gameState.scores[socket.id] = (gameState.scores[socket.id] || 0) + 1;
         if (users[drawerSocketId]) {
           gameState.scores[drawerSocketId] =
             (gameState.scores[drawerSocketId] || 0) + 1;
         }
-
         io.to(room).emit("game:correct_guess", {
           guesser: user,
           word: gameState.word,
         });
-
         const winnerId = Object.keys(gameState.scores).find(
           (id) => gameState.scores[id] >= WINNING_SCORE
         );
@@ -219,13 +215,10 @@ io.on("connection", (socket) => {
         } else {
           setTimeout(() => startNewRound(room), 3000);
         }
-        return; // Return because this was a correct guess, not a chat message.
+        return;
       }
-      // If it's an incorrect guess, it will fall through and be sent as a regular message.
     }
 
-    // --- STANDARD MESSAGE HANDLING ---
-    // This part now handles all public/private chat AND incorrect guesses in a game.
     const messageId = `${Date.now()}-${socket.id}`;
     const msg = {
       id: socket.id,
@@ -305,14 +298,12 @@ io.on("connection", (socket) => {
       scores: gameState.scores || {},
       drawer: gameState.drawer,
     });
-    // Send drawing history to the new player if round is active
     if (gameState.isRoundActive && gameState.drawingHistory) {
       socket.emit("game:drawing_history", gameState.drawingHistory);
     }
     io.emit("game:roomsList", Object.values(activeGameRooms));
   });
 
-  // New handler for a player leaving a game room without disconnecting
   socket.on("game:leave", (roomId) => {
     socket.leave(roomId);
     handlePlayerLeave(socket.id, roomId);
