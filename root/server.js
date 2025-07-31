@@ -11,7 +11,7 @@ const server = http.createServer(app);
 const allowedOrigin = "https://anonymous-chat-frontend-gray.vercel.app";
 
 const corsOptions = {
-  origin: "*",
+  origin: "https://anonymous-chat-frontend-gray.vercel.app", //
   methods: ["GET", "POST"],
 };
 
@@ -97,6 +97,10 @@ io.on("connection", (socket) => {
         "room history",
         chatHistory[roomName].map((entry) => entry.msg)
       );
+    }
+    // If joining an active game room, send the current drawing
+    if (gameStates[roomName] && gameStates[roomName].isRoundActive) {
+      socket.emit("game:drawing_history", gameStates[roomName].drawingHistory);
     }
   });
 
@@ -282,6 +286,7 @@ io.on("connection", (socket) => {
       isRoundActive: false,
       creatorId: room.creatorId,
       currentPlayerIndex: -1,
+      drawingHistory: [], // To store drawing data for the current round
     };
 
     startNewRound(roomId);
@@ -290,20 +295,28 @@ io.on("connection", (socket) => {
   socket.on("game:stop", (roomId) => {
     const room = activeGameRooms[roomId];
     const user = users[socket.id];
-    const gameState = gameStates[roomId];
 
-    if (!room || !user || !gameState || user.id !== room.creatorId) return;
+    if (!room || !user || user.id !== room.creatorId) return;
 
-    if (gameState.roundTimer) clearTimeout(gameState.roundTimer);
+    // Notify players and make them leave the room
+    io.to(roomId).emit(
+      "game:terminated",
+      "The host has terminated the game room."
+    );
 
-    gameState.isRoundActive = false;
-    io.to(roomId).emit("game:message", "The host has stopped the game.");
-    io.to(roomId).emit("game:state", {
-      players: room.players,
-      creatorId: room.creatorId,
-      isRoundActive: false,
-      scores: gameState.scores,
-    });
+    const socketsInRoom = io.sockets.adapter.rooms.get(roomId);
+    if (socketsInRoom) {
+      socketsInRoom.forEach((socketId) => {
+        io.sockets.sockets.get(socketId).leave(roomId);
+      });
+    }
+
+    // Clean up server state
+    delete activeGameRooms[roomId];
+    delete gameStates[roomId];
+
+    // Update room list for all clients
+    io.emit("game:roomsList", Object.values(activeGameRooms));
   });
 
   socket.on("game:draw", ({ room, data }) => {
@@ -313,12 +326,15 @@ io.on("connection", (socket) => {
       gameState.isRoundActive &&
       socket.id === gameState.drawer.id
     ) {
+      gameState.drawingHistory.push(data); // Save the drawing command
       socket.to(room).emit("game:draw", data);
     }
   });
 
   socket.on("game:clear_canvas", (room) => {
-    if (gameStates[room] && gameStates[room].drawer.id === socket.id) {
+    const gameState = gameStates[room];
+    if (gameState && gameState.drawer.id === socket.id) {
+      gameState.drawingHistory = []; // Clear history on server
       io.to(room).emit("game:clear_canvas");
     }
   });
@@ -417,6 +433,7 @@ io.on("connection", (socket) => {
       return;
     }
 
+    gameState.drawingHistory = []; // Clear drawing history for the new round
     gameState.players = room.players.map((p) => p.id);
     const nextDrawerIndex =
       (gameState.currentPlayerIndex + 1) % gameState.players.length;
