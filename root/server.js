@@ -4,180 +4,320 @@ const { Server } = require("socket.io");
 const cors = require("cors");
 
 const app = express();
-// It's good practice to have the express cors middleware as well.
-app.use(cors({ origin: "https://anonymous-chat-frontend-gray.vercel.app" }));
-
 const server = http.createServer(app);
-
-// --- SECURE CORS CONFIGURATION for Socket.IO ---
 const io = new Server(server, {
-  cors: {
-    // This is the crucial part. Only your specified frontend can connect.
-    origin: "https://anonymous-chat-frontend-gray.vercel.app",
-    methods: ["GET", "POST"],
-  },
+  cors: { origin: "*", methods: ["GET", "POST"] },
 });
 
 // --- STATE MANAGEMENT ---
-const users = {}; // Stores user data: { socket.id: { id, name, gender, age } }
-const chatHistory = {}; // Stores message history: { roomName: [ { msg, timestamp } ] }
-// roomSettings is no longer needed as backgrounds are client-side.
-const messageSenders = {}; // Tracks message sender for read receipts: { messageId: senderSocketId }
+const users = {}; // { socket.id: { id, name, gender, age } }
+const games = {}; // { gameId: { ...gameState } }
+const chatHistory = {}; // { roomName: [ { msg, timestamp } ] }
+const messageSenders = {}; // { messageId: senderSocketId }
+const userMessageTimestamps = {}; // { socketId: [timestamp1, ...] }
 
-// --- RATE LIMITING CONSTANTS ---
-const userMessageTimestamps = {}; // { socketId: [timestamp1, timestamp2, ...] }
-const RATE_LIMIT_COUNT = 5; // Max 5 messages
-const RATE_LIMIT_SECONDS = 5; // per 5 seconds
+// --- CONSTANTS ---
+const RATE_LIMIT_COUNT = 5;
+const RATE_LIMIT_SECONDS = 5;
+const WORD_LIST = [
+  "house",
+  "car",
+  "tree",
+  "sun",
+  "dog",
+  "cat",
+  "computer",
+  "javascript",
+  "banana",
+  "guitar",
+  "ocean",
+  "mountain",
+  "star",
+  "moon",
+  "pizza",
+  "bicycle",
+  "flower",
+  "bridge",
+  "river",
+  "cloud",
+];
 
-const FIVE_MINUTES_IN_MS = 5 * 60 * 1000;
-
-// Periodically clear out old messages from history to prevent memory leaks
-setInterval(() => {
-  const now = Date.now();
-  for (const room in chatHistory) {
-    chatHistory[room] = chatHistory[room].filter(
-      (entry) => now - entry.timestamp < FIVE_MINUTES_IN_MS
-    );
+// --- GAME HELPER FUNCTIONS ---
+function createNewGame(host, gameName) {
+  const gameId = `game_${Date.now()}`;
+  games[gameId] = {
+    id: gameId,
+    name: gameName,
+    hostId: host.id,
+    players: [],
+    status: "waiting",
+    currentRound: 0,
+    maxRounds: 5,
+    timer: 60,
+    currentDrawerId: null,
+    drawer: {},
+    currentWord: "",
+    wordToGuess: "",
+    roundTimeout: null,
+  };
+  return games[gameId];
+}
+function joinGame(player, gameId) {
+  const game = games[gameId];
+  if (!game || game.players.length >= 10 || game.status !== "waiting")
+    return null;
+  if (!game.players.find((p) => p.id === player.id)) {
+    game.players.push({ ...player, score: 0 });
   }
-}, 60 * 1000); // Run this check every minute
+  return game;
+}
+function leaveGame(playerId) {
+  for (const gameId in games) {
+    const game = games[gameId];
+    const playerIndex = game.players.findIndex((p) => p.id === playerId);
+    if (playerIndex !== -1) {
+      const [leftPlayer] = game.players.splice(playerIndex, 1);
+      if (game.hostId === playerId && game.players.length > 0)
+        game.hostId = game.players[0].id;
+      if (game.currentDrawerId === playerId && game.status === "in-progress")
+        endRound(gameId, "The drawer left the game.");
+      if (game.players.length === 0) {
+        clearTimeout(game.roundTimeout);
+        delete games[gameId];
+      }
+      return { game, leftPlayer };
+    }
+  }
+  return null;
+}
+function startRound(gameId) {
+  const game = games[gameId];
+  if (!game || game.players.length < 2) return;
+  clearTimeout(game.roundTimeout);
+  game.status = "in-progress";
+  game.currentRound++;
+  game.timer = 60;
+  const lastDrawerIndex = game.players.findIndex(
+    (p) => p.id === game.currentDrawerId
+  );
+  const newDrawerIndex = (lastDrawerIndex + 1) % game.players.length;
+  game.drawer = game.players[newDrawerIndex];
+  game.currentDrawerId = game.drawer.id;
+  game.currentWord = WORD_LIST[Math.floor(Math.random() * WORD_LIST.length)];
+  game.wordToGuess = "_ ".repeat(game.currentWord.length).trim();
+  io.to(game.drawer.id).emit("game:state_update", {
+    ...game,
+    wordToGuess: game.currentWord,
+  });
+  game.roundTimeout = setInterval(() => {
+    if (game.status !== "in-progress") return;
+    game.timer--;
+    if (game.timer <= 0) {
+      endRound(gameId, `Time's up! The word was: ${game.currentWord}`);
+    } else {
+      io.to(game.id).emit("game:state_update", game);
+    }
+  }, 1000);
+  io.to(gameId).emit("game:clear_canvas");
+  io.to(gameId).emit("game:chat_message", {
+    type: "system",
+    message: `Round ${game.currentRound}! ${game.drawer.name} is drawing.`,
+  });
+  io.to(game.id).emit("game:state_update", game);
+}
+function endRound(gameId, reason) {
+  const game = games[gameId];
+  if (!game || game.status !== "in-progress") return;
+  clearTimeout(game.roundTimeout);
+  game.status = "round-over";
+  io.to(gameId).emit("game:chat_message", { type: "system", message: reason });
+  io.to(gameId).emit("game:state_update", game);
 
+  if (game.currentRound >= game.maxRounds) {
+    game.status = "game-over";
+    io.to(gameId).emit("game:chat_message", {
+      type: "system",
+      message: "Game Over! Thanks for playing!",
+    });
+    io.to(gameId).emit("game:state_update", game);
+    setTimeout(() => {
+      delete games[gameId];
+      io.emit("lobby:update", games);
+    }, 10000);
+  } else {
+    setTimeout(() => startRound(gameId), 5000);
+  }
+}
+
+// --- MAIN CONNECTION HANDLER ---
 io.on("connection", (socket) => {
   console.log("🟢 User connected:", socket.id);
-  // Initialize rate limiting array for the new user
   userMessageTimestamps[socket.id] = [];
 
-  // Listen for user profile information
-  socket.on("user info", ({ nickname, gender, age }) => {
-    // Basic validation for user info
-    if (
-      typeof nickname !== "string" ||
-      nickname.trim().length === 0 ||
-      nickname.length > 20
-    ) {
-      return; // Ignore invalid nickname
-    }
-    users[socket.id] = {
-      id: socket.id,
-      name: nickname.trim(),
-      gender,
-      age,
-    };
-    // Broadcast the updated user list to all clients
+  socket.on("user:set_info", ({ nickname, gender, age }) => {
+    users[socket.id] = { id: socket.id, name: nickname, gender, age };
     io.emit("user list", Object.values(users));
-  });
-
-  // Listen for a user joining a room
-  socket.on("join room", (roomName) => {
-    socket.join(roomName);
-
-    // Send recent message history for this room to the joining user
-    if (chatHistory[roomName]) {
-      const history = chatHistory[roomName].map((entry) => entry.msg);
-      socket.emit("room history", history);
-    }
-    // Background settings are no longer sent from the server.
-  });
-
-  // Listen for incoming chat messages
-  socket.on("chat message", ({ room, text }) => {
-    const user = users[socket.id];
-    if (!user) return; // Ignore messages from users who haven't set their info
-
-    // --- Server-Side Validation & Rate Limiting ---
-    if (
-      typeof text !== "string" ||
-      text.trim().length === 0 ||
-      text.length > 500
-    ) {
-      return; // Ignore invalid or empty messages
-    }
-
-    const now = Date.now();
-    // Clear timestamps older than the rate limit window
-    userMessageTimestamps[socket.id] = userMessageTimestamps[socket.id].filter(
-      (timestamp) => now - timestamp < RATE_LIMIT_SECONDS * 1000
+    socket.emit(
+      "chat:history",
+      chatHistory["public"] ? chatHistory["public"].map((e) => e.msg) : []
     );
-    // Check if the user has exceeded the message limit
-    if (userMessageTimestamps[socket.id].length >= RATE_LIMIT_COUNT) {
-      socket.emit(
-        "rate limit",
-        "You are sending messages too quickly. Please slow down."
-      );
-      return; // Stop message processing
-    }
-    // Add the current message timestamp
-    userMessageTimestamps[socket.id].push(now);
-    // ---
+  });
 
-    const messageId = `${Date.now()}-${socket.id}`; // Create a unique message ID
+  // --- Chat Listeners ---
+  socket.on("chat:join_room", (roomName) => {
+    socket.join(roomName);
+    socket.emit(
+      "chat:history",
+      chatHistory[roomName] ? chatHistory[roomName].map((e) => e.msg) : []
+    );
+  });
+  socket.on("chat:message", ({ room, text }) => {
+    const user = users[socket.id];
+    if (!user) return;
+    const now = Date.now();
+    userMessageTimestamps[socket.id] = userMessageTimestamps[socket.id].filter(
+      (t) => now - t < RATE_LIMIT_SECONDS * 1000
+    );
+    if (userMessageTimestamps[socket.id].length >= RATE_LIMIT_COUNT) {
+      return socket.emit(
+        "chat:rate_limit",
+        "You are sending messages too quickly."
+      );
+    }
+    userMessageTimestamps[socket.id].push(now);
+    const messageId = `${Date.now()}-${socket.id}`;
     const msg = {
       id: socket.id,
-      to: room.replace(socket.id, "").replace("-", ""), // For private messages
-      messageId: messageId,
+      to: room.replace(socket.id, "").replace("-", ""),
+      messageId,
       name: user.name,
       gender: user.gender,
       age: user.age,
       text: text.trim(),
       room,
-      status: "sent", // Default status for read receipts
+      status: "sent",
     };
-
-    // Track who sent which message for read receipts
     messageSenders[messageId] = socket.id;
-
-    if (!chatHistory[room]) {
-      chatHistory[room] = [];
-    }
+    if (!chatHistory[room]) chatHistory[room] = [];
     chatHistory[room].push({ msg, timestamp: Date.now() });
-
-    // Send the message to everyone in the room
-    io.to(room).emit("chat message", msg);
+    io.to(room).emit("chat:message", msg);
   });
-
-  // Listen for when a message is read in a private chat
+  socket.on("chat:typing", ({ room }) => {
+    if (users[socket.id])
+      socket
+        .to(room)
+        .emit("chat:typing", { name: users[socket.id].name, room });
+  });
+  socket.on("chat:stop_typing", ({ room }) => {
+    if (users[socket.id]) socket.to(room).emit("chat:stop_typing", { room });
+  });
   socket.on("message read", ({ room, messageId }) => {
-    const senderSocketId = messageSenders[messageId];
-    // If we find the original sender, emit an event back to *only* them
-    if (senderSocketId) {
-      io.to(senderSocketId).emit("message was read", { room, messageId });
+    const senderId = messageSenders[messageId];
+    if (senderId)
+      io.to(senderId).emit("chat:message_read", { room, messageId });
+  });
+
+  // --- Game Listeners ---
+  socket.on("lobby:request_update", () => socket.emit("lobby:update", games));
+  socket.on("lobby:create_game", ({ name }) => {
+    const game = createNewGame(users[socket.id], name);
+    socket.join(game.id);
+    joinGame(users[socket.id], game.id);
+    socket.emit("game:joined", game);
+    io.emit("lobby:update", games);
+  });
+  socket.on("lobby:join_game", ({ gameId }) => {
+    const game = joinGame(users[socket.id], gameId);
+    if (game) {
+      socket.join(gameId);
+      socket.emit("game:joined", game);
+      io.to(gameId).emit("game:state_update", game);
+      io.to(gameId).emit("game:chat_message", {
+        type: "system",
+        message: `${users[socket.id].name} has joined!`,
+      });
+      io.emit("lobby:update", games);
+    }
+  });
+  socket.on("game:leave", () => {
+    const result = leaveGame(socket.id);
+    if (result) {
+      const { game, leftPlayer } = result;
+      socket.leave(game.id);
+      socket.emit("game:left");
+      io.to(game.id).emit("game:state_update", game);
+      io.to(game.id).emit("game:chat_message", {
+        type: "system",
+        message: `${leftPlayer.name} has left.`,
+      });
+      io.emit("lobby:update", games);
+    }
+  });
+  socket.on("game:start", () => {
+    const game = Object.values(games).find((g) => g.hostId === socket.id);
+    if (game) startRound(game.id);
+  });
+  socket.on("game:draw", (data) => {
+    const game = Object.values(games).find(
+      (g) => g.currentDrawerId === socket.id
+    );
+    if (game) socket.to(game.id).emit("game:draw_event", data);
+  });
+  socket.on("game:clear_canvas", () => {
+    const game = Object.values(games).find(
+      (g) => g.currentDrawerId === socket.id
+    );
+    if (game) io.to(game.id).emit("game:clear_canvas");
+  });
+  socket.on("game:guess", ({ guess }) => {
+    const game = Object.values(games).find((g) =>
+      g.players.some((p) => p.id === socket.id)
+    );
+    const player = users[socket.id];
+    if (
+      !game ||
+      !player ||
+      game.currentDrawerId === socket.id ||
+      game.status !== "in-progress"
+    )
+      return;
+    io.to(game.id).emit("game:chat_message", {
+      type: "guess",
+      name: player.name,
+      message: guess,
+    });
+    if (guess.toLowerCase() === game.currentWord.toLowerCase()) {
+      const guesser = game.players.find((p) => p.id === socket.id);
+      const drawer = game.players.find((p) => p.id === game.currentDrawerId);
+      if (guesser) guesser.score += 10;
+      if (drawer) drawer.score += 5;
+      io.to(game.id).emit("game:chat_message", {
+        type: "correct-guess",
+        name: player.name,
+      });
+      endRound(game.id, `Round over! Next round starting soon...`);
     }
   });
 
-  // The 'set background' event listener is removed from the server.
-
-  // Listen for typing events
-  socket.on("typing", ({ room }) => {
-    const user = users[socket.id];
-    if (user) {
-      socket.to(room).emit("typing", { name: user.name, room });
-    }
-  });
-
-  // Listen for stop typing events
-  socket.on("stop typing", ({ room }) => {
-    const user = users[socket.id];
-    if (user) {
-      socket.to(room).emit("stop typing", { name: user.name, room });
-    }
-  });
-
-  // Handle user disconnection
+  // --- Disconnect ---
   socket.on("disconnect", () => {
     console.log("🔴 User disconnected:", socket.id);
+    const result = leaveGame(socket.id);
+    if (result) {
+      const { game, leftPlayer } = result;
+      io.to(game.id).emit("game:state_update", game);
+      io.to(game.id).emit("game:chat_message", {
+        type: "system",
+        message: `${leftPlayer.name} has disconnected.`,
+      });
+      io.emit("lobby:update", games);
+    }
     delete users[socket.id];
-    // Clean up rate limit data for the disconnected user
     delete userMessageTimestamps[socket.id];
-    // Broadcast the new user list
     io.emit("user list", Object.values(users));
   });
 });
 
-// A simple root route to confirm the server is running
-app.get("/", (req, res) => {
-  res.send("✅ Anonymous Chat Backend is running smoothly.");
-});
-
+app.get("/", (req, res) => res.send("✅ Chat & Game Backend is running."));
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`🚀 Server is running on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`🚀 Server is running on port ${PORT}`));
