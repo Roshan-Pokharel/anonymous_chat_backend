@@ -178,11 +178,17 @@ io.on("connection", (socket) => {
     userMessageTimestamps[socket.id].push(now);
 
     const gameState = gameStates[room];
-    if (
-      gameState &&
-      gameState.isRoundActive &&
-      socket.id !== gameState.drawer.id
-    ) {
+
+    // --- MODIFIED GAME LOGIC ---
+    // If the message is in an active game room, treat it as a potential guess
+    if (gameState && gameState.isRoundActive) {
+      // If the sender is the drawer, block them from chatting.
+      if (socket.id === gameState.drawer.id) {
+        socket.emit("rate limit", "You cannot chat while drawing.");
+        return;
+      }
+
+      // If the sender is a guesser, check their answer
       if (text.trim().toLowerCase() === gameState.word.toLowerCase()) {
         clearTimeout(gameState.roundTimer);
 
@@ -213,10 +219,13 @@ io.on("connection", (socket) => {
         } else {
           setTimeout(() => startNewRound(room), 3000);
         }
-        return;
+        return; // Return because this was a correct guess, not a chat message.
       }
+      // If it's an incorrect guess, it will fall through and be sent as a regular message.
     }
 
+    // --- STANDARD MESSAGE HANDLING ---
+    // This part now handles all public/private chat AND incorrect guesses in a game.
     const messageId = `${Date.now()}-${socket.id}`;
     const msg = {
       id: socket.id,
