@@ -193,16 +193,22 @@ io.on("connection", (socket) => {
     if (!user) return;
 
     const roomId = `game-${randomUUID()}`;
-    activeGameRooms[roomId] = {
+    const newRoom = {
       id: roomId,
       name: roomName || `${user.name}'s Room`,
       creatorId: socket.id,
       creatorName: user.name,
       players: [user],
     };
+    activeGameRooms[roomId] = newRoom;
 
     socket.join(roomId);
-    socket.emit("game:joined", activeGameRooms[roomId]);
+    socket.emit("game:joined", newRoom); // Tell creator they joined
+    io.to(roomId).emit("game:state", {
+      creatorId: newRoom.creatorId,
+      players: newRoom.players,
+      isRoundActive: false,
+    });
     io.emit("game:roomsList", Object.values(activeGameRooms));
   });
 
@@ -211,17 +217,25 @@ io.on("connection", (socket) => {
     const room = activeGameRooms[roomId];
     if (!user || !room) return;
 
-    // Prevent joining the same room twice
     if (room.players.some((p) => p.id === user.id)) return;
 
     room.players.push(user);
     socket.join(roomId);
-    socket.emit("game:joined", room);
+
+    socket.emit("game:joined", room); // Tell joiner they joined
     io.to(roomId).emit("chat message", {
       room: roomId,
       text: `${user.name} has joined the game!`,
       name: "System",
     });
+
+    // Notify everyone in the room of the new state
+    io.to(roomId).emit("game:state", {
+      creatorId: room.creatorId,
+      players: room.players,
+      isRoundActive: false,
+    });
+
     io.emit("game:roomsList", Object.values(activeGameRooms));
   });
 
@@ -229,8 +243,12 @@ io.on("connection", (socket) => {
   socket.on("game:start", (roomId) => {
     const room = activeGameRooms[roomId];
     const user = users[socket.id];
-    // Only the creator can start the game
+
     if (!room || !user || user.id !== room.creatorId) return;
+    if (room.players.length < 2) {
+      socket.emit("game:message", "You need at least 2 players to start.");
+      return;
+    }
 
     const roomUsers = room.players.map((p) => p.id);
     gameStates[roomId] = {
@@ -263,37 +281,47 @@ io.on("connection", (socket) => {
     console.log("🔴 User disconnected:", socket.id);
     const user = users[socket.id];
     if (user) {
-      // Handle game room cleanup
       for (const roomId in activeGameRooms) {
         const room = activeGameRooms[roomId];
         const playerIndex = room.players.findIndex((p) => p.id === socket.id);
 
         if (playerIndex > -1) {
           room.players.splice(playerIndex, 1);
+          const wasGameActive =
+            gameStates[roomId] && gameStates[roomId].isRoundActive;
 
-          // If room is empty, delete it
           if (room.players.length === 0) {
             delete activeGameRooms[roomId];
             delete gameStates[roomId];
           } else {
-            // If the creator left, assign a new creator
-            if (room.creatorId === socket.id) {
+            const wasCreator = room.creatorId === socket.id;
+            if (wasCreator) {
               room.creatorId = room.players[0].id;
               room.creatorName = room.players[0].name;
             }
-            // If a game was active and the drawer left, start a new round
+
             const gameState = gameStates[roomId];
-            if (
+            const wasDrawer =
               gameState &&
-              gameState.isRoundActive &&
-              gameState.drawer.id === socket.id
-            ) {
+              gameState.drawer &&
+              gameState.drawer.id === socket.id;
+
+            if (wasGameActive && wasDrawer) {
               io.to(roomId).emit(
                 "game:message",
-                "The drawer disconnected. Starting a new round."
+                "The drawer disconnected. Starting new round."
               );
               clearTimeout(gameState.roundTimer);
               startNewRound(roomId);
+            } else {
+              // Notify remaining players of the change
+              io.to(roomId).emit("game:state", {
+                creatorId: room.creatorId,
+                players: room.players,
+                isRoundActive: gameState ? gameState.isRoundActive : false,
+                scores: gameState ? gameState.scores : {},
+                drawer: gameState ? gameState.drawer : null,
+              });
             }
           }
           io.emit("game:roomsList", Object.values(activeGameRooms));
@@ -312,13 +340,20 @@ io.on("connection", (socket) => {
     if (!gameState || !room || room.players.length < 2) {
       io.to(roomId).emit(
         "game:end",
-        "Not enough players to continue the game. Waiting for more..."
+        "Not enough players to continue. Waiting for more..."
       );
       if (gameState) gameState.isRoundActive = false;
+      // Also update the creator's UI
+      io.to(roomId).emit("game:state", {
+        creatorId: room.creatorId,
+        players: room.players,
+        isRoundActive: false,
+        scores: gameState ? gameState.scores : {},
+      });
       return;
     }
 
-    gameState.players = room.players.map((p) => p.id); // Refresh player list
+    gameState.players = room.players.map((p) => p.id);
 
     const currentDrawerIndex = gameState.drawer
       ? gameState.players.indexOf(gameState.drawer.id)
@@ -328,7 +363,7 @@ io.on("connection", (socket) => {
     const drawerUser = users[drawerId];
 
     if (!drawerUser) {
-      startNewRound(roomId); // Try again if user data not found
+      startNewRound(roomId);
       return;
     }
 
@@ -338,7 +373,7 @@ io.on("connection", (socket) => {
     gameState.word = word;
     gameState.isRoundActive = true;
     gameState.roundStart = Date.now();
-    gameState.creatorId = room.creatorId; // Ensure creatorId is fresh
+    gameState.creatorId = room.creatorId;
 
     gameState.roundTimer = setTimeout(() => {
       io.to(roomId).emit("game:message", `Time's up! The word was '${word}'.`);
@@ -350,6 +385,7 @@ io.on("connection", (socket) => {
       isRoundActive: true,
       scores: gameState.scores,
       creatorId: gameState.creatorId,
+      players: room.players,
     });
     io.to(drawerId).emit("game:word_prompt", word);
   }
