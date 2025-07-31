@@ -11,7 +11,7 @@ const server = http.createServer(app);
 const allowedOrigin = "https://anonymous-chat-frontend-gray.vercel.app";
 
 const corsOptions = {
-  origin: allowedOrigin,
+  origin: "*",
   methods: ["GET", "POST"],
 };
 
@@ -52,6 +52,7 @@ const GAME_WORDS = [
   "fish",
 ];
 const ROUND_TIME = 60 * 1000; // 60 seconds
+const WINNING_SCORE = 5;
 
 // --- RATE LIMITING CONSTANTS ---
 const userMessageTimestamps = {};
@@ -97,10 +98,6 @@ io.on("connection", (socket) => {
         chatHistory[roomName].map((entry) => entry.msg)
       );
     }
-    // If joining a game room, send its state
-    if (gameStates[roomName] && gameStates[roomName].isRoundActive) {
-      socket.emit("game:state", gameStates[roomName]);
-    }
   });
 
   socket.on("chat message", ({ room, text }) => {
@@ -132,20 +129,44 @@ io.on("connection", (socket) => {
       socket.id !== gameState.drawer.id
     ) {
       if (text.trim().toLowerCase() === gameState.word.toLowerCase()) {
+        clearTimeout(gameState.roundTimer); // Stop the timer
+
         const drawerSocketId = gameState.drawer.id;
-        gameState.scores[socket.id] = (gameState.scores[socket.id] || 0) + 10;
-        gameState.scores[drawerSocketId] =
-          (gameState.scores[drawerSocketId] || 0) + 5;
+        // Award 1 point to guesser and 1 to drawer
+        gameState.scores[socket.id] = (gameState.scores[socket.id] || 0) + 1;
+        if (users[drawerSocketId]) {
+          gameState.scores[drawerSocketId] =
+            (gameState.scores[drawerSocketId] || 0) + 1;
+        }
 
         io.to(room).emit("game:correct_guess", {
           guesser: user,
           word: gameState.word,
-          scores: gameState.scores,
         });
 
-        clearTimeout(gameState.roundTimer);
-        startNewRound(room);
-        return; // Stop processing as a regular chat message
+        // Check for a winner
+        const winnerId = Object.keys(gameState.scores).find(
+          (id) => gameState.scores[id] >= WINNING_SCORE
+        );
+
+        if (winnerId && users[winnerId]) {
+          const winner = users[winnerId];
+          const finalScores = { ...gameState.scores };
+
+          // Reset game state
+          gameState.isRoundActive = false;
+          gameState.drawer = null;
+          gameState.word = null;
+          Object.keys(gameState.scores).forEach(
+            (id) => (gameState.scores[id] = 0)
+          );
+
+          io.to(room).emit("game:over", { winner, scores: finalScores });
+        } else {
+          // If no winner, start a new round after a short delay
+          setTimeout(() => startNewRound(room), 2000);
+        }
+        return;
       }
     }
 
@@ -203,39 +224,41 @@ io.on("connection", (socket) => {
     activeGameRooms[roomId] = newRoom;
 
     socket.join(roomId);
-    socket.emit("game:joined", newRoom); // Tell creator they joined
-    io.to(roomId).emit("game:state", {
-      creatorId: newRoom.creatorId,
-      players: newRoom.players,
-      isRoundActive: false,
-    });
+    socket.emit("game:joined", newRoom);
     io.emit("game:roomsList", Object.values(activeGameRooms));
+
+    // Send initial state for the new room
+    io.to(roomId).emit("game:state", {
+      players: newRoom.players,
+      creatorId: newRoom.creatorId,
+      isRoundActive: false,
+      scores: {},
+    });
   });
 
   socket.on("game:join", (roomId) => {
     const user = users[socket.id];
     const room = activeGameRooms[roomId];
     if (!user || !room) return;
-
     if (room.players.some((p) => p.id === user.id)) return;
 
     room.players.push(user);
     socket.join(roomId);
+    socket.emit("game:joined", room);
 
-    socket.emit("game:joined", room); // Tell joiner they joined
     io.to(roomId).emit("chat message", {
       room: roomId,
       text: `${user.name} has joined the game!`,
       name: "System",
     });
 
-    // Notify everyone in the room of the new state
+    const gameState = gameStates[roomId] || {};
     io.to(roomId).emit("game:state", {
-      creatorId: room.creatorId,
       players: room.players,
-      isRoundActive: false,
+      creatorId: room.creatorId,
+      isRoundActive: gameState.isRoundActive || false,
+      scores: gameState.scores || {},
     });
-
     io.emit("game:roomsList", Object.values(activeGameRooms));
   });
 
@@ -250,16 +273,37 @@ io.on("connection", (socket) => {
       return;
     }
 
-    const roomUsers = room.players.map((p) => p.id);
+    const initialScores = {};
+    room.players.forEach((p) => (initialScores[p.id] = 0));
+
     gameStates[roomId] = {
-      players: roomUsers,
-      scores: {},
+      players: room.players.map((p) => p.id),
+      scores: initialScores,
       isRoundActive: false,
       creatorId: room.creatorId,
+      currentPlayerIndex: -1,
     };
-    roomUsers.forEach((id) => (gameStates[roomId].scores[id] = 0));
 
     startNewRound(roomId);
+  });
+
+  socket.on("game:stop", (roomId) => {
+    const room = activeGameRooms[roomId];
+    const user = users[socket.id];
+    const gameState = gameStates[roomId];
+
+    if (!room || !user || !gameState || user.id !== room.creatorId) return;
+
+    if (gameState.roundTimer) clearTimeout(gameState.roundTimer);
+
+    gameState.isRoundActive = false;
+    io.to(roomId).emit("game:message", "The host has stopped the game.");
+    io.to(roomId).emit("game:state", {
+      players: room.players,
+      creatorId: room.creatorId,
+      isRoundActive: false,
+      scores: gameState.scores,
+    });
   });
 
   socket.on("game:draw", ({ room, data }) => {
@@ -269,13 +313,14 @@ io.on("connection", (socket) => {
       gameState.isRoundActive &&
       socket.id === gameState.drawer.id
     ) {
-      // Broadcast to others in the room
       socket.to(room).emit("game:draw", data);
     }
   });
 
   socket.on("game:clear_canvas", (room) => {
-    io.to(room).emit("game:clear_canvas");
+    if (gameStates[room] && gameStates[room].drawer.id === socket.id) {
+      io.to(room).emit("game:clear_canvas");
+    }
   });
 
   socket.on("disconnect", () => {
@@ -288,43 +333,62 @@ io.on("connection", (socket) => {
 
         if (playerIndex > -1) {
           room.players.splice(playerIndex, 1);
-          const wasGameActive =
-            gameStates[roomId] && gameStates[roomId].isRoundActive;
 
-          if (room.players.length === 0) {
-            delete activeGameRooms[roomId];
-            delete gameStates[roomId];
+          const gameState = gameStates[roomId];
+          if (!gameState) {
+            if (room.players.length === 0) {
+              delete activeGameRooms[roomId];
+            } else {
+              // If creator leaves, assign a new one
+              if (room.creatorId === socket.id) {
+                room.creatorId = room.players[0].id;
+                room.creatorName = room.players[0].name;
+              }
+            }
+            io.emit("game:roomsList", Object.values(activeGameRooms));
+            continue;
+          }
+
+          const wasGameActive = gameState.isRoundActive;
+
+          if (room.players.length < 2) {
+            if (wasGameActive) {
+              if (gameState.roundTimer) clearTimeout(gameState.roundTimer);
+              gameState.isRoundActive = false;
+              io.to(roomId).emit(
+                "game:message",
+                "Not enough players to continue the game."
+              );
+            }
+            if (room.players.length === 0) {
+              delete activeGameRooms[roomId];
+              delete gameStates[roomId];
+            }
           } else {
             const wasCreator = room.creatorId === socket.id;
             if (wasCreator) {
               room.creatorId = room.players[0].id;
               room.creatorName = room.players[0].name;
             }
-
-            const gameState = gameStates[roomId];
             const wasDrawer =
-              gameState &&
-              gameState.drawer &&
-              gameState.drawer.id === socket.id;
-
+              gameState.drawer && gameState.drawer.id === socket.id;
             if (wasGameActive && wasDrawer) {
               io.to(roomId).emit(
                 "game:message",
-                "The drawer disconnected. Starting new round."
+                "The drawer disconnected. Starting a new round."
               );
               clearTimeout(gameState.roundTimer);
               startNewRound(roomId);
-            } else {
-              // Notify remaining players of the change
-              io.to(roomId).emit("game:state", {
-                creatorId: room.creatorId,
-                players: room.players,
-                isRoundActive: gameState ? gameState.isRoundActive : false,
-                scores: gameState ? gameState.scores : {},
-                drawer: gameState ? gameState.drawer : null,
-              });
             }
           }
+
+          // Notify everyone of the updated state
+          io.to(roomId).emit("game:state", {
+            players: room.players,
+            creatorId: room.creatorId,
+            isRoundActive: gameState.isRoundActive,
+            scores: gameState.scores,
+          });
           io.emit("game:roomsList", Object.values(activeGameRooms));
         }
       }
@@ -339,15 +403,14 @@ io.on("connection", (socket) => {
     const room = activeGameRooms[roomId];
 
     if (!gameState || !room || room.players.length < 2) {
+      if (gameState) gameState.isRoundActive = false;
       io.to(roomId).emit(
         "game:end",
         "Not enough players to continue. Waiting for more..."
       );
-      if (gameState) gameState.isRoundActive = false;
-      // Also update the creator's UI
       io.to(roomId).emit("game:state", {
-        creatorId: room.creatorId,
-        players: room.players,
+        creatorId: room ? room.creatorId : null,
+        players: room ? room.players : [],
         isRoundActive: false,
         scores: gameState ? gameState.scores : {},
       });
@@ -355,15 +418,16 @@ io.on("connection", (socket) => {
     }
 
     gameState.players = room.players.map((p) => p.id);
+    const nextDrawerIndex =
+      (gameState.currentPlayerIndex + 1) % gameState.players.length;
+    gameState.currentPlayerIndex = nextDrawerIndex;
 
-    const currentDrawerIndex = gameState.drawer
-      ? gameState.players.indexOf(gameState.drawer.id)
-      : -1;
-    const nextDrawerIndex = (currentDrawerIndex + 1) % gameState.players.length;
     const drawerId = gameState.players[nextDrawerIndex];
     const drawerUser = users[drawerId];
 
     if (!drawerUser) {
+      // This can happen if a user disconnects at the wrong time. We try the next one.
+      console.log(`Could not find drawer user for id ${drawerId}, skipping.`);
       startNewRound(roomId);
       return;
     }
@@ -373,8 +437,8 @@ io.on("connection", (socket) => {
     gameState.drawer = drawerUser;
     gameState.word = word;
     gameState.isRoundActive = true;
-    gameState.roundStart = Date.now();
-    gameState.creatorId = room.creatorId;
+
+    io.to(roomId).emit("game:new_round");
 
     gameState.roundTimer = setTimeout(() => {
       io.to(roomId).emit("game:message", `Time's up! The word was '${word}'.`);
@@ -385,9 +449,10 @@ io.on("connection", (socket) => {
       drawer: drawerUser,
       isRoundActive: true,
       scores: gameState.scores,
-      creatorId: gameState.creatorId,
+      creatorId: room.creatorId,
       players: room.players,
     });
+
     io.to(drawerId).emit("game:word_prompt", word);
   }
 });
