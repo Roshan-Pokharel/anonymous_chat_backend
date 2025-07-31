@@ -18,51 +18,40 @@ const io = new Server(server, {
 // --- STATE MANAGEMENT ---
 const users = {}; // { socket.id: { id, name, gender, age } }
 const chatHistory = {}; // { roomName: [ { msg, timestamp } ] }
-const messageSenders = {}; // { messageId: senderSocketId }
-const gameStates = {}; // { roomName: { drawer, word, scores, etc. } }
+const gameStates = {}; // { roomName: { status, host, players, drawer, word, etc. } }
 
 // --- GAME CONSTANTS ---
 const GAME_WORDS = [
-  "apple",
-  "banana",
-  "car",
-  "house",
-  "tree",
-  "star",
-  "sun",
-  "moon",
-  "dog",
-  "cat",
+  "Starry Night",
+  "Mona Lisa",
+  "The Persistence of Memory",
+  "Guitar",
+  "Sunrise",
+  "Eiffel Tower",
+  "Statue of Liberty",
+  "Castle",
+  "Dragon",
+  "Spaceship",
 ];
-const ROUND_TIME = 60 * 1000; // 60 seconds
+const ROUND_TIME = 60 * 1000; // 90 seconds for drawing
 
-// --- RATE LIMITING CONSTANTS ---
+// --- RATE LIMITING ---
 const userMessageTimestamps = {};
-const RATE_LIMIT_COUNT = 5;
+const RATE_LIMIT_COUNT = 10;
 const RATE_LIMIT_SECONDS = 5;
-const FIVE_MINUTES_IN_MS = 5 * 60 * 1000;
-
-setInterval(() => {
-  const now = Date.now();
-  for (const room in chatHistory) {
-    chatHistory[room] = chatHistory[room].filter(
-      (entry) => now - entry.timestamp < FIVE_MINUTES_IN_MS
-    );
-  }
-}, 60 * 1000);
 
 io.on("connection", (socket) => {
-  console.log("🟢 User connected:", socket.id);
+  console.log(`🟢 User connected: ${socket.id}`);
   userMessageTimestamps[socket.id] = [];
 
+  // --- USER & CHAT HANDLERS ---
   socket.on("user info", ({ nickname, gender, age }) => {
     if (
       typeof nickname !== "string" ||
       nickname.trim().length === 0 ||
       nickname.length > 20
-    ) {
+    )
       return;
-    }
     users[socket.id] = { id: socket.id, name: nickname.trim(), gender, age };
     io.emit("user list", Object.values(users));
   });
@@ -75,143 +64,178 @@ io.on("connection", (socket) => {
         chatHistory[roomName].map((entry) => entry.msg)
       );
     }
-    // If a game is in progress, send the current state to the new user
-    if (gameStates[roomName] && gameStates[roomName].isRoundActive) {
-      socket.emit("game:state", gameStates[roomName]);
+    // Send current game state if one exists for this room
+    if (gameStates[roomName]) {
+      socket.emit("game:state_update", gameStates[roomName]);
     }
   });
 
   socket.on("chat message", ({ room, text }) => {
     const user = users[socket.id];
-    if (!user) return;
     if (
+      !user ||
       typeof text !== "string" ||
       text.trim().length === 0 ||
       text.length > 500
-    ) {
+    )
       return;
-    }
+
+    // Rate Limiting Check
     const now = Date.now();
     userMessageTimestamps[socket.id] = userMessageTimestamps[socket.id].filter(
-      (timestamp) => now - timestamp < RATE_LIMIT_SECONDS * 1000
+      (t) => now - t < RATE_LIMIT_SECONDS * 1000
     );
     if (userMessageTimestamps[socket.id].length >= RATE_LIMIT_COUNT) {
-      socket.emit("rate limit", "You are sending messages too quickly.");
-      return;
+      return socket.emit("rate limit", "You are sending messages too quickly.");
     }
     userMessageTimestamps[socket.id].push(now);
 
-    // --- GAME GUESS CHECK ---
+    // Game Guess Check
     const gameState = gameStates[room];
     if (
       gameState &&
-      gameState.isRoundActive &&
+      gameState.status === "playing" &&
+      gameState.drawer &&
       socket.id !== gameState.drawer.id
     ) {
       if (text.trim().toLowerCase() === gameState.word.toLowerCase()) {
-        // Correct guess!
         const drawerSocketId = gameState.drawer.id;
         gameState.scores[socket.id] = (gameState.scores[socket.id] || 0) + 10;
-        gameState.scores[drawerSocketId] =
-          (gameState.scores[drawerSocketId] || 0) + 5;
-
+        if (users[drawerSocketId]) {
+          // Ensure drawer is still connected
+          gameState.scores[drawerSocketId] =
+            (gameState.scores[drawerSocketId] || 0) + 5;
+        }
         io.to(room).emit("game:correct_guess", {
           guesser: user,
           word: gameState.word,
-          scores: gameState.scores,
         });
-
-        // End the round and start a new one
         clearTimeout(gameState.roundTimer);
         startNewRound(room);
-        return; // Stop processing as a regular chat message
+        return;
       }
     }
 
-    const messageId = `${Date.now()}-${socket.id}`;
     const msg = {
       id: socket.id,
-      to: room.replace(socket.id, "").replace("-", ""),
-      messageId,
       name: user.name,
       gender: user.gender,
       age: user.age,
       text: text.trim(),
       room,
-      status: "sent",
     };
-    messageSenders[messageId] = socket.id;
     if (!chatHistory[room]) chatHistory[room] = [];
     chatHistory[room].push({ msg, timestamp: Date.now() });
     io.to(room).emit("chat message", msg);
   });
 
-  socket.on("message read", ({ room, messageId }) => {
-    const senderSocketId = messageSenders[messageId];
-    if (senderSocketId) {
-      io.to(senderSocketId).emit("message was read", { room, messageId });
+  // --- GAME LOGIC HANDLERS ---
+
+  // A player wants to create a new game lobby
+  socket.on("game:create", (room) => {
+    if (gameStates[room]) {
+      return socket.emit(
+        "game:error",
+        "A game is already in progress in this room."
+      );
     }
+    const hostUser = users[socket.id];
+    if (!hostUser) return;
+
+    gameStates[room] = {
+      status: "lobby",
+      host: hostUser,
+      players: { [socket.id]: hostUser },
+      scores: { [socket.id]: 0 },
+    };
+    io.to(room).emit("game:state_update", gameStates[room]);
   });
 
-  socket.on("typing", ({ room }) => {
-    const user = users[socket.id];
-    if (user) socket.to(room).emit("typing", { name: user.name, room });
+  // A player wants to join an existing game lobby
+  socket.on("game:join", (room) => {
+    const gameState = gameStates[room];
+    const player = users[socket.id];
+    if (!gameState || gameState.status !== "lobby" || !player) return;
+
+    gameState.players[socket.id] = player;
+    gameState.scores[socket.id] = 0;
+    io.to(room).emit("game:state_update", gameState);
   });
 
-  socket.on("stop typing", ({ room }) => {
-    const user = users[socket.id];
-    if (user) socket.to(room).emit("stop typing", { name: user.name, room });
-  });
-
-  // --- GAME EVENTS ---
+  // The host starts the game from the lobby
   socket.on("game:start", (room) => {
-    if (!gameStates[room]) {
-      const roomUsers = Array.from(io.sockets.adapter.rooms.get(room) || []);
-      gameStates[room] = {
-        players: roomUsers,
-        scores: {},
-        isRoundActive: false,
-      };
-      // Initialize scores
-      roomUsers.forEach((id) => (gameStates[room].scores[id] = 0));
+    const gameState = gameStates[room];
+    if (!gameState || gameState.host.id !== socket.id) return;
+    if (Object.keys(gameState.players).length < 2) {
+      return socket.emit("game:error", "You need at least 2 players to start.");
     }
+    gameState.status = "playing";
+    gameState.playerOrder = Object.keys(gameState.players); // Initial player order
+    gameState.currentDrawerIndex = -1;
     startNewRound(room);
   });
 
-  socket.on("game:draw", ({ room, data }) => {
+  // The host or a player cancels/leaves the game
+  socket.on("game:cancel", (room) => {
     const gameState = gameStates[room];
-    if (
-      gameState &&
-      gameState.isRoundActive &&
-      socket.id === gameState.drawer.id
-    ) {
-      socket.to(room).emit("game:draw", data);
+    if (!gameState) return;
+    // If the host cancels, end the game for everyone
+    if (gameState.host.id === socket.id) {
+      delete gameStates[room];
+      io.to(room).emit("game:state_update", null); // Clear state on clients
+      io.to(room).emit("game:message", {
+        text: `${users[socket.id]?.name || "Host"} has ended the game.`,
+      });
+    } else {
+      // If a player leaves
+      delete gameState.players[socket.id];
+      io.to(room).emit("game:state_update", gameState);
     }
   });
 
+  // Handling drawing data
+  socket.on("game:draw", ({ room, drawData }) => {
+    const gameState = gameStates[room];
+    if (gameState && gameState.drawer && socket.id === gameState.drawer.id) {
+      socket.to(room).emit("game:draw", drawData);
+    }
+  });
+
+  // Handling canvas clear
   socket.on("game:clear_canvas", (room) => {
     io.to(room).emit("game:clear_canvas");
   });
 
+  // --- DISCONNECT LOGIC ---
   socket.on("disconnect", () => {
-    console.log("🔴 User disconnected:", socket.id);
-    const user = users[socket.id];
-    if (user) {
-      // Handle game state if a player disconnects
+    console.log(`🔴 User disconnected: ${socket.id}`);
+    const disconnectingUser = users[socket.id];
+    if (disconnectingUser) {
+      // Check if the user was in any games
       for (const room in gameStates) {
         const gameState = gameStates[room];
-        if (gameState.players.includes(socket.id)) {
-          gameState.players = gameState.players.filter(
-            (id) => id !== socket.id
-          );
-          if (gameState.drawer && gameState.drawer.id === socket.id) {
-            // Drawer disconnected, start a new round
-            io.to(room).emit(
-              "game:message",
-              "The drawer disconnected. Starting a new round."
-            );
-            clearTimeout(gameState.roundTimer);
-            startNewRound(room);
+        if (gameState.players[socket.id]) {
+          // If the host disconnects, end the game
+          if (gameState.host.id === socket.id) {
+            io.to(room).emit("game:message", {
+              text: `Host ${disconnectingUser.name} disconnected. The game has ended.`,
+            });
+            delete gameStates[room];
+            io.to(room).emit("game:state_update", null);
+          } else {
+            // If a player disconnects
+            delete gameState.players[socket.id];
+            // If the drawer disconnected, start a new round
+            if (gameState.drawer && gameState.drawer.id === socket.id) {
+              io.to(room).emit("game:message", {
+                text: `Drawer ${disconnectingUser.name} disconnected. Starting a new round.`,
+              });
+              clearTimeout(gameState.roundTimer);
+              startNewRound(room);
+            } else {
+              // Just update the player list for others
+              io.to(room).emit("game:state_update", gameState);
+            }
           }
         }
       }
@@ -221,57 +245,49 @@ io.on("connection", (socket) => {
     io.emit("user list", Object.values(users));
   });
 
+  // --- GAME HELPER FUNCTIONS ---
   function startNewRound(room) {
     const gameState = gameStates[room];
-    if (!gameState || gameState.players.length < 2) {
-      io.to(room).emit("game:end", "Not enough players to start a game.");
-      if (gameState) delete gameStates[room];
+    if (!gameState || Object.keys(gameState.players).length < 2) {
+      io.to(room).emit("game:message", {
+        text: "Not enough players to continue. The game has ended.",
+      });
+      delete gameStates[room];
+      io.to(room).emit("game:state_update", null);
       return;
     }
 
-    // Select next drawer (simple rotation)
-    const currentDrawerIndex = gameState.drawer
-      ? gameState.players.indexOf(gameState.drawer.id)
-      : -1;
-    const nextDrawerIndex = (currentDrawerIndex + 1) % gameState.players.length;
-    const drawerId = gameState.players[nextDrawerIndex];
-    const drawerUser = users[drawerId];
+    gameState.currentDrawerIndex =
+      (gameState.currentDrawerIndex + 1) % gameState.playerOrder.length;
+    const drawerId = gameState.playerOrder[gameState.currentDrawerIndex];
+    const drawerUser = gameState.players[drawerId];
 
     if (!drawerUser) {
-      // If drawer user data is not found, try next
-      gameState.players.splice(nextDrawerIndex, 1);
+      // If drawer left, try next player
+      gameState.playerOrder.splice(gameState.currentDrawerIndex, 1);
+      gameState.currentDrawerIndex--; // Adjust index for next increment
       startNewRound(room);
       return;
     }
 
     const word = GAME_WORDS[Math.floor(Math.random() * GAME_WORDS.length)];
-
     gameState.drawer = drawerUser;
     gameState.word = word;
-    gameState.isRoundActive = true;
-    gameState.roundStart = Date.now();
 
-    // Set timer to end the round
     gameState.roundTimer = setTimeout(() => {
-      io.to(room).emit("game:message", `Time's up! The word was '${word}'.`);
+      io.to(room).emit("game:message", {
+        text: `Time's up! The word was "${word}".`,
+      });
       startNewRound(room);
     }, ROUND_TIME);
 
-    io.to(room).emit("game:state", {
-      drawer: drawerUser,
-      isRoundActive: true,
-      scores: gameState.scores,
-    });
-    // Send the word only to the drawer
+    io.to(room).emit("game:state_update", gameState);
     io.to(drawerId).emit("game:word_prompt", word);
+    io.to(room).emit("game:clear_canvas");
   }
 });
 
-app.get("/", (req, res) => {
-  res.send("✅ Anonymous Chat Backend is running smoothly.");
-});
-
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`🚀 Server is running on port ${PORT}`);
-});
+app.get("/", (req, res) => res.send("✅ Doodle Dash Chat Backend is running."));
+server.listen(process.env.PORT || 3000, () =>
+  console.log(`🚀 Server on port ${process.env.PORT || 3000}`)
+);
