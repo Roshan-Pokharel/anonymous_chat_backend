@@ -5,15 +5,22 @@ const cors = require("cors");
 const { randomUUID } = require("crypto");
 
 const app = express();
-app.use(cors({ origin: "https://anonymous-chat-frontend-gray.vercel.app/" }));
-
 const server = http.createServer(app);
 
+// --- CORS Configuration ---
+const allowedOrigin = "https://anonymous-chat-frontend-gray.vercel.app";
+
+const corsOptions = {
+  origin: allowedOrigin,
+  methods: ["GET", "POST"],
+};
+
+// Use CORS middleware for Express
+app.use(cors(corsOptions));
+
+// Initialize Socket.IO with the same CORS options
 const io = new Server(server, {
-  cors: {
-    origin: "https://anonymous-chat-frontend-gray.vercel.app/",
-    methods: ["GET", "POST"],
-  },
+  cors: corsOptions,
 });
 
 // --- STATE MANAGEMENT ---
