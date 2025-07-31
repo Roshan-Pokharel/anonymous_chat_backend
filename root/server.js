@@ -269,6 +269,7 @@ io.on("connection", (socket) => {
       gameState.isRoundActive &&
       socket.id === gameState.drawer.id
     ) {
+      // Broadcast to others in the room
       socket.to(room).emit("game:draw", data);
     }
   });
