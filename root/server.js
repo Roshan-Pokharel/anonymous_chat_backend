@@ -8,7 +8,7 @@ const app = express();
 const server = http.createServer(app);
 
 const corsOptions = {
-  origin: "*",
+  origin: "https://anonymous-chat-frontend-gray.vercel.app",
   methods: ["GET", "POST"],
 };
 
