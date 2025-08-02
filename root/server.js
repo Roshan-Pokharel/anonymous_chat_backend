@@ -485,12 +485,19 @@ io.on("connection", (socket) => {
     gameState.drawer = drawerUser;
     gameState.word = word;
     gameState.isRoundActive = true;
+    const roundEndTime = Date.now() + ROUND_TIME;
+    gameState.roundEndTime = roundEndTime;
+
     io.to(roomId).emit("game:new_round");
 
     // Set a timer for the round
+    if (gameState.roundTimer) clearTimeout(gameState.roundTimer);
     gameState.roundTimer = setTimeout(() => {
       io.to(roomId).emit("game:message", `Time's up! The word was '${word}'.`);
-      startNewRound(roomId);
+      // Add a delay before starting the next round so players can see the message
+      setTimeout(() => {
+        startNewRound(roomId);
+      }, 3000); // 3-second delay
     }, ROUND_TIME);
 
     io.to(roomId).emit("game:state", {
@@ -499,6 +506,7 @@ io.on("connection", (socket) => {
       scores: gameState.scores,
       creatorId: room.creatorId,
       players: room.players,
+      roundEndTime: roundEndTime, // Send end time to clients
     });
     // Send the word only to the drawer
     io.to(drawerId).emit("game:word_prompt", word);
