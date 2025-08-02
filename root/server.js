@@ -7,6 +7,8 @@ const { randomUUID } = require("crypto");
 const app = express();
 const server = http.createServer(app);
 
+// --- CORS Configuration ---
+// Explicitly allow requests from your Vercel frontend.
 const corsOptions = {
   origin: "https://anonymous-chat-frontend-gray.vercel.app",
   methods: ["GET", "POST"],
@@ -656,10 +658,13 @@ function startNewHangmanRound(roomId) {
   gameState.correctGuesses = [];
   gameState.isRoundActive = true;
   gameState.isGameOver = false;
-  gameState.currentPlayerIndex =
-    gameState.currentPlayerIndex !== undefined
-      ? (gameState.currentPlayerIndex + 1) % 2
-      : 0;
+
+  // FIX: This is a safer way to determine the starting player and avoid crashes.
+  let nextIndex = 0; // Default for the first round
+  if (typeof gameState.currentPlayerIndex === "number") {
+    nextIndex = (gameState.currentPlayerIndex + 1) % 2;
+  }
+  gameState.currentPlayerIndex = nextIndex;
   gameState.currentPlayerTurn = room.players[gameState.currentPlayerIndex].id;
   gameState.winner = null;
 
