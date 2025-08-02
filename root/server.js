@@ -8,9 +8,9 @@ const app = express();
 const server = http.createServer(app);
 
 // --- CORS Configuration ---
-// Explicitly allow requests from your Vercel frontend.
 const corsOptions = {
-  origin: "https://anonymous-chat-frontend-gray.vercel.app",
+  // Replace with your actual frontend URL in production
+  origin: "*",
   methods: ["GET", "POST"],
 };
 
@@ -659,7 +659,7 @@ function startNewHangmanRound(roomId) {
   gameState.isRoundActive = true;
   gameState.isGameOver = false;
 
-  // FIX: This is a safer way to determine the starting player and avoid crashes.
+  // Determine starting player. If a game was just played, the next player starts.
   let nextIndex = 0; // Default for the first round
   if (typeof gameState.currentPlayerIndex === "number") {
     nextIndex = (gameState.currentPlayerIndex + 1) % 2;
@@ -686,7 +686,6 @@ function handleHangmanGuess(socket, user, room, letter, gameState) {
   if (cleanedLetter.length !== 1 || !/^[a-z]$/.test(cleanedLetter)) {
     socket.emit("rate limit", "Please guess a single letter.");
     setHangmanTurnTimer(room); // Restart timer for the same player
-    io.to(room).emit("game:state", { gameType: "hangman", ...gameState });
     return;
   }
 
@@ -696,7 +695,6 @@ function handleHangmanGuess(socket, user, room, letter, gameState) {
   ) {
     socket.emit("rate limit", `You already guessed '${cleanedLetter}'.`);
     setHangmanTurnTimer(room); // Restart timer for the same player
-    io.to(room).emit("game:state", { gameType: "hangman", ...gameState });
     return;
   }
 
@@ -746,18 +744,37 @@ function handleHangmanGuess(socket, user, room, letter, gameState) {
     io.to(room).emit("game:message", `😥 Game over! The word was "${word}".`);
     setTimeout(() => startNewHangmanRound(room), 5000);
   } else {
-    // If guess was incorrect, switch turns. Otherwise, it's the same player's turn.
-    if (!correctGuess) {
+    // Game is not over, so determine the next turn.
+    if (correctGuess) {
+      // Player guessed correctly, so it's their turn again.
+      // We don't change the currentPlayerTurn or currentPlayerIndex.
+      io.to(room).emit("chat message", {
+        room,
+        text: `${user.name} guessed correctly! They get to go again.`,
+        name: "System",
+      });
+    } else {
+      // Player guessed incorrectly, so switch to the other player.
       const currentRoom = activeGameRooms[room];
       if (currentRoom && currentRoom.players.length > 0) {
         gameState.currentPlayerIndex =
           (gameState.currentPlayerIndex + 1) % currentRoom.players.length;
         gameState.currentPlayerTurn =
           currentRoom.players[gameState.currentPlayerIndex].id;
+        const nextPlayer = users[gameState.currentPlayerTurn];
+        io.to(room).emit("chat message", {
+          room,
+          text: `Incorrect. It's now ${
+            nextPlayer ? nextPlayer.name : "the other player"
+          }'s turn.`,
+          name: "System",
+        });
       }
     }
-    setHangmanTurnTimer(room); // Set timer for the next turn (or same player if correct)
+    // Set the timer for the next turn.
+    setHangmanTurnTimer(room);
   }
+  // Send the updated state to all players.
   io.to(room).emit("game:state", { gameType: "hangman", ...gameState });
 }
 
