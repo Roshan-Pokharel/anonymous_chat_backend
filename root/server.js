@@ -7,9 +7,8 @@ const { randomUUID } = require("crypto");
 const app = express();
 const server = http.createServer(app);
 
-// Configure CORS to allow connections from your frontend application
 const corsOptions = {
-  origin: "*", // Using "*" for broader compatibility, but you can restrict it
+  origin: "*",
   methods: ["GET", "POST"],
 };
 
@@ -20,11 +19,11 @@ const io = new Server(server, {
 });
 
 // --- STATE MANAGEMENT ---
-const users = {}; // Stores user data { socket.id: {id, name, gender, age} }
-const chatHistory = {}; // Stores message history for rooms { roomName: [{msg, timestamp}] }
-const messageSenders = {}; // Maps messageId to the sender's socketId for read receipts
-const gameStates = {}; // Stores the state of active games { roomId: gameState }
-let activeGameRooms = {}; // Stores metadata for game rooms { roomId: roomData }
+const users = {};
+const chatHistory = {};
+const messageSenders = {};
+const gameStates = {};
+let activeGameRooms = {};
 
 // --- GAME CONSTANTS ---
 const DOODLE_WORDS = [
@@ -89,17 +88,16 @@ const HANGMAN_WORDS = [
   "interface",
   "repository",
 ];
-const ROUND_TIME = 60 * 1000; // 60 seconds per round for Doodle
-const WINNING_SCORE = 10; // First player to 10 points wins Doodle
-const MAX_INCORRECT_GUESSES = 6; // For Hangman
+const ROUND_TIME = 60 * 1000;
+const WINNING_SCORE = 10;
+const MAX_INCORRECT_GUESSES = 6;
 
 // --- RATE LIMITING CONSTANTS ---
-const userMessageTimestamps = {}; // { socket.id: [timestamps] }
-const RATE_LIMIT_COUNT = 5; // Max 5 messages
-const RATE_LIMIT_SECONDS = 5; // per 5 seconds
+const userMessageTimestamps = {};
+const RATE_LIMIT_COUNT = 5;
+const RATE_LIMIT_SECONDS = 5;
 const FIVE_MINUTES_IN_MS = 5 * 60 * 1000;
 
-// Periodically clean up old messages from chat history to manage memory
 setInterval(() => {
   const now = Date.now();
   for (const room in chatHistory) {
@@ -109,10 +107,6 @@ setInterval(() => {
   }
 }, 60 * 1000);
 
-/**
- * Generates a public list of active game rooms.
- * @returns {Array} A list of game room objects with non-sensitive data.
- */
 function getPublicRoomList() {
   return Object.values(activeGameRooms).map((room) => ({
     id: room.id,
@@ -121,15 +115,10 @@ function getPublicRoomList() {
     players: room.players,
     hasPassword: !!room.password,
     inProgress: room.inProgress || false,
-    gameType: room.gameType, // Include gameType
+    gameType: room.gameType,
   }));
 }
 
-/**
- * Handles the logic for when a player leaves a game room.
- * @param {string} socketId - The socket ID of the leaving player.
- * @param {string} roomId - The ID of the room being left.
- */
 function handlePlayerLeave(socketId, roomId) {
   const room = activeGameRooms[roomId];
   if (!room) return;
@@ -146,7 +135,9 @@ function handlePlayerLeave(socketId, roomId) {
   });
 
   const gameState = gameStates[roomId];
-  if (room.players.length < (room.gameType === "doodle" ? 2 : 1)) {
+  const minPlayers = room.gameType === "doodle" ? 2 : 2;
+
+  if (room.players.length < minPlayers) {
     if (gameState && gameState.isRoundActive) {
       if (gameState.roundTimer) clearTimeout(gameState.roundTimer);
       io.to(roomId).emit(
@@ -157,7 +148,6 @@ function handlePlayerLeave(socketId, roomId) {
     delete activeGameRooms[roomId];
     delete gameStates[roomId];
   } else {
-    // Game continues
     if (room.creatorId === socketId) {
       room.creatorId = room.players[0].id;
       room.creatorName = room.players[0].name;
@@ -167,26 +157,35 @@ function handlePlayerLeave(socketId, roomId) {
       );
     }
 
-    if (
-      gameState &&
-      gameState.isRoundActive &&
-      room.gameType === "doodle" &&
-      gameState.drawer.id === socketId
-    ) {
-      io.to(roomId).emit(
-        "game:message",
-        "The drawer left. Starting a new round."
-      );
-      clearTimeout(gameState.roundTimer);
-      startNewDoodleRound(roomId);
-    } else {
-      if (gameState) {
-        io.to(roomId).emit("game:state", {
-          ...gameState,
-          players: room.players,
-          creatorId: room.creatorId,
-        });
+    if (gameState && gameState.isRoundActive) {
+      if (room.gameType === "doodle" && gameState.drawer.id === socketId) {
+        io.to(roomId).emit(
+          "game:message",
+          "The drawer left. Starting a new round."
+        );
+        clearTimeout(gameState.roundTimer);
+        startNewDoodleRound(roomId);
+      } else if (
+        room.gameType === "hangman" &&
+        gameState.currentPlayerTurn === socketId
+      ) {
+        // Switch turn if the current player leaves
+        gameState.currentPlayerIndex =
+          gameState.currentPlayerIndex % room.players.length;
+        gameState.currentPlayerTurn =
+          room.players[gameState.currentPlayerIndex].id;
+        io.to(roomId).emit(
+          "game:message",
+          "The current player left. Switching turns."
+        );
       }
+    }
+    if (gameState) {
+      io.to(roomId).emit("game:state", {
+        ...gameState,
+        players: room.players,
+        creatorId: room.creatorId,
+      });
     }
   }
   io.emit("game:roomsList", getPublicRoomList());
@@ -219,7 +218,6 @@ io.on("connection", (socket) => {
     }
   });
 
-  // --- Main Chat Message Handler ---
   socket.on("chat message", ({ room, text }) => {
     const user = users[socket.id];
     if (!user) return;
@@ -243,16 +241,15 @@ io.on("connection", (socket) => {
     const gameState = gameStates[room];
     const roomData = activeGameRooms[room];
 
-    // Game-specific message handling
-    if (gameState && gameState.isRoundActive) {
-      if (roomData.gameType === "doodle") {
-        handleDoodleGuess(socket, user, room, text, gameState);
-        return;
-      }
-      // Hangman guesses are handled by a different event
+    if (
+      gameState &&
+      gameState.isRoundActive &&
+      roomData.gameType === "doodle"
+    ) {
+      handleDoodleGuess(socket, user, room, text, gameState);
+      return;
     }
 
-    // Standard chat message
     const messageId = `${Date.now()}-${socket.id}`;
     const msg = {
       id: socket.id,
@@ -290,7 +287,6 @@ io.on("connection", (socket) => {
   });
 
   // --- GAME EVENTS ---
-
   socket.on("game:create", ({ roomName, password, gameType }) => {
     const user = users[socket.id];
     if (!user) return;
@@ -331,6 +327,13 @@ io.on("connection", (socket) => {
       return;
     }
     if (room.players.some((p) => p.id === user.id)) return;
+    if (room.gameType === "hangman" && room.players.length >= 2) {
+      socket.emit(
+        "game:join_error",
+        "This Hangman room is full (2 players max)."
+      );
+      return;
+    }
 
     room.players.push(user);
     socket.join(roomId);
@@ -364,11 +367,11 @@ io.on("connection", (socket) => {
     const user = users[socket.id];
     if (!room || !user || user.id !== room.creatorId) return;
 
-    const minPlayers = room.gameType === "doodle" ? 2 : 1;
+    const minPlayers = room.gameType === "doodle" ? 2 : 2;
     if (room.players.length < minPlayers) {
       socket.emit(
         "game:message",
-        `You need at least ${minPlayers} player(s) to start.`
+        `You need exactly ${minPlayers} players to start Hangman.`
       );
       return;
     }
@@ -417,7 +420,6 @@ io.on("connection", (socket) => {
     io.emit("game:roomsList", getPublicRoomList());
   });
 
-  // Doodle Specific Events
   socket.on("game:draw", ({ room, data }) => {
     const gameState = gameStates[room];
     if (
@@ -438,7 +440,6 @@ io.on("connection", (socket) => {
     }
   });
 
-  // Hangman Specific Event
   socket.on("hangman:guess", ({ room, letter }) => {
     const user = users[socket.id];
     const gameState = gameStates[room];
@@ -449,6 +450,10 @@ io.on("connection", (socket) => {
       gameState.gameType !== "hangman"
     )
       return;
+    if (socket.id !== gameState.currentPlayerTurn) {
+      socket.emit("rate limit", "It's not your turn to guess.");
+      return;
+    }
 
     handleHangmanGuess(socket, user, room, letter, gameState);
   });
@@ -468,7 +473,6 @@ io.on("connection", (socket) => {
 });
 
 // --- DOODLE DASH LOGIC ---
-
 function handleDoodleGuess(socket, user, room, text, gameState) {
   if (socket.id === gameState.drawer.id) {
     socket.emit("rate limit", "You cannot chat while drawing.");
@@ -504,7 +508,6 @@ function handleDoodleGuess(socket, user, room, text, gameState) {
       setTimeout(() => startNewDoodleRound(room), 3000);
     }
   } else {
-    // Broadcast incorrect guesses as regular messages
     const msg = {
       id: user.id,
       name: user.name,
@@ -585,11 +588,10 @@ function startNewDoodleRound(roomId) {
 }
 
 // --- HANGMAN LOGIC ---
-
 function startNewHangmanRound(roomId) {
   const gameState = gameStates[roomId];
   const room = activeGameRooms[roomId];
-  if (!gameState || !room || room.players.length < 1) {
+  if (!gameState || !room || room.players.length < 2) {
     if (room) room.inProgress = false;
     io.to(roomId).emit("game:end", "Not enough players. Game over.");
     io.emit("game:roomsList", getPublicRoomList());
@@ -605,6 +607,12 @@ function startNewHangmanRound(roomId) {
   gameState.correctGuesses = [];
   gameState.isRoundActive = true;
   gameState.isGameOver = false;
+  gameState.currentPlayerIndex =
+    gameState.currentPlayerIndex !== undefined
+      ? (gameState.currentPlayerIndex + 1) % 2
+      : 0;
+  gameState.currentPlayerTurn = room.players[gameState.currentPlayerIndex].id;
+  gameState.winner = null;
 
   io.to(roomId).emit("game:new_round");
   io.to(roomId).emit("game:state", {
@@ -654,20 +662,29 @@ function handleHangmanGuess(socket, user, room, letter, gameState) {
       } guessed an incorrect letter: ${cleanedLetter.toUpperCase()}`,
       name: "System",
     });
+    // Switch turns on incorrect guess
+    gameState.currentPlayerIndex = (gameState.currentPlayerIndex + 1) % 2;
+    gameState.currentPlayerTurn =
+      activeGameRooms[room].players[gameState.currentPlayerIndex].id;
   }
 
-  // Check for win/loss
   const won = !gameState.displayWord.includes("_");
   const lost = gameState.incorrectGuesses.length >= MAX_INCORRECT_GUESSES;
 
-  if (won || lost) {
+  if (won) {
     gameState.isRoundActive = false;
     gameState.isGameOver = true;
-    const message = won
-      ? `You won! The word was "${word}".`
-      : `You lost! The word was "${word}".`;
-    io.to(room).emit("game:message", message);
-    setTimeout(() => startNewHangmanRound(room), 5000); // Start new round after 5 seconds
+    gameState.winner = user;
+    io.to(room).emit(
+      "game:message",
+      `🎉 ${user.name} won! The word was "${word}".`
+    );
+    setTimeout(() => startNewHangmanRound(room), 5000);
+  } else if (lost) {
+    gameState.isRoundActive = false;
+    gameState.isGameOver = true;
+    io.to(room).emit("game:message", `😥 Game over! The word was "${word}".`);
+    setTimeout(() => startNewHangmanRound(room), 5000);
   }
 
   io.to(room).emit("game:state", { gameType: "hangman", ...gameState });
