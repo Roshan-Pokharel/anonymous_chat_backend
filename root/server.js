@@ -9,7 +9,7 @@ const server = http.createServer(app);
 
 // --- CORS Configuration ---
 const corsOptions = {
-  origin: "*", // Allow all origins for simplicity. In production, restrict this.
+  origin: "https://anonymous-chat-frontend-gray.vercel.app/",
   methods: ["GET", "POST"],
 };
 
