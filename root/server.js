@@ -9,7 +9,7 @@ const server = http.createServer(app);
 
 // --- CORS Configuration ---
 const corsOptions = {
-  origin: "https://anonymous-chat-frontend-gray.vercel.app",
+  origin: "*", // Allow all origins for simplicity. In production, restrict this.
   methods: ["GET", "POST"],
 };
 
@@ -89,7 +89,7 @@ const HANGMAN_WORDS = [
   "interface",
   "repository",
 ];
-const ROUND_TIME = 60 * 1000;
+const DOODLE_ROUND_TIME = 60 * 1000;
 const HANGMAN_TURN_TIME = 20 * 1000;
 const WINNING_SCORE = 10;
 const MAX_INCORRECT_GUESSES = 6;
@@ -174,15 +174,17 @@ function handlePlayerLeave(socketId, roomId) {
         room.gameType === "hangman" &&
         gameState.currentPlayerTurn === socketId
       ) {
-        // The current player left, immediately switch turns
-        gameState.currentPlayerIndex %= room.players.length;
-        gameState.currentPlayerTurn =
-          room.players[gameState.currentPlayerIndex].id;
+        // The current player left, end the game as Hangman is 2-player only.
         io.to(roomId).emit(
           "game:message",
-          "The current player left. Switching turns."
+          "A player left. The Hangman game has ended."
         );
-        setHangmanTurnTimer(roomId); // Start timer for the next player
+        io.to(roomId).emit(
+          "game:terminated",
+          "A player left, ending the game."
+        );
+        delete activeGameRooms[roomId];
+        delete gameStates[roomId];
       }
     }
     if (gameState) {
@@ -570,14 +572,14 @@ function startNewDoodleRound(roomId) {
   gameState.drawer = drawerUser;
   gameState.word = word;
   gameState.isRoundActive = true;
-  const roundEndTime = Date.now() + ROUND_TIME;
+  const roundEndTime = Date.now() + DOODLE_ROUND_TIME;
   gameState.roundEndTime = roundEndTime;
   io.to(roomId).emit("game:new_round");
   if (gameState.roundTimer) clearTimeout(gameState.roundTimer);
   gameState.roundTimer = setTimeout(() => {
     io.to(roomId).emit("game:message", `Time's up! The word was '${word}'.`);
     setTimeout(() => startNewDoodleRound(roomId), 3000);
-  }, ROUND_TIME);
+  }, DOODLE_ROUND_TIME);
   io.to(roomId).emit("game:state", {
     gameType: "doodle",
     drawer: drawerUser,
@@ -591,57 +593,25 @@ function startNewDoodleRound(roomId) {
 }
 
 // --- HANGMAN LOGIC ---
-function setHangmanTurnTimer(roomId) {
-  const gameState = gameStates[roomId];
-  if (!gameState || !gameState.isRoundActive) return;
 
-  if (gameState.turnTimer) clearTimeout(gameState.turnTimer);
-
-  gameState.turnEndTime = Date.now() + HANGMAN_TURN_TIME;
-  gameState.turnTimer = setTimeout(() => {
-    handleHangmanTimeout(roomId);
-  }, HANGMAN_TURN_TIME);
-}
-
-function handleHangmanTimeout(roomId) {
-  const gameState = gameStates[roomId];
-  const room = activeGameRooms[roomId];
-  if (!gameState || !room || !gameState.isRoundActive) return;
-
-  const timedOutPlayer = users[gameState.currentPlayerTurn];
-  io.to(roomId).emit("chat message", {
-    room: roomId,
-    text: `${
-      timedOutPlayer ? timedOutPlayer.name : "Player"
-    }'s turn timed out.`,
-    name: "System",
-  });
-
-  gameState.incorrectGuesses.push(" "); // Add a space or other marker for a timeout
-
-  const lost = gameState.incorrectGuesses.length >= MAX_INCORRECT_GUESSES;
-  if (lost) {
-    gameState.isRoundActive = false;
-    gameState.isGameOver = true;
-    io.to(roomId).emit(
-      "game:message",
-      `😥 Game over! The word was "${gameState.word}".`
-    );
-    setTimeout(() => startNewHangmanRound(roomId), 5000);
-  } else {
-    // Switch turns
-    gameState.currentPlayerIndex =
-      (gameState.currentPlayerIndex + 1) % room.players.length;
-    gameState.currentPlayerTurn = room.players[gameState.currentPlayerIndex].id;
-    setHangmanTurnTimer(roomId);
-  }
-  io.to(roomId).emit("game:state", { gameType: "hangman", ...gameState });
+/**
+ * Creates a "clean" version of the game state that is safe to send over Socket.IO.
+ * This prevents "Maximum call stack size exceeded" errors by removing circular references.
+ * @param {object} gameState The original game state object.
+ * @returns {object} A new object that is safe to serialize and emit.
+ */
+function getSerializableGameState(gameState) {
+  const stateToSend = { ...gameState };
+  // The 'turnTimer' is a complex Node.js Timeout object with circular references.
+  // It cannot be serialized and sent over the network, so we must remove it.
+  delete stateToSend.turnTimer;
+  return stateToSend;
 }
 
 function startNewHangmanRound(roomId) {
-  const gameState = gameStates[roomId];
   const room = activeGameRooms[roomId];
-  if (!gameState || !room || room.players.length < 2) {
+  const gameState = gameStates[roomId];
+  if (!room || !gameState || room.players.length < 2) {
     if (room) room.inProgress = false;
     io.to(roomId).emit("game:end", "Not enough players. Game over.");
     io.emit("game:roomsList", getPublicRoomList());
@@ -649,29 +619,30 @@ function startNewHangmanRound(roomId) {
   }
 
   const word = HANGMAN_WORDS[Math.floor(Math.random() * HANGMAN_WORDS.length)];
-  gameState.word = word.toLowerCase();
-  gameState.displayWord = word
-    .split("")
-    .map((char) => (char === " " ? " " : "_"));
-  gameState.incorrectGuesses = [];
-  gameState.correctGuesses = [];
-  gameState.isRoundActive = true;
-  gameState.isGameOver = false;
+  const lastWinnerIndex = gameState.lastWinnerIndex;
+  let currentPlayerIndex =
+    typeof lastWinnerIndex === "number"
+      ? (lastWinnerIndex + 1) % 2
+      : Math.floor(Math.random() * 2);
 
-  // Determine starting player. If a game was just played, the next player starts.
-  let nextIndex = 0; // Default for the first round
-  if (typeof gameState.currentPlayerIndex === "number") {
-    nextIndex = (gameState.currentPlayerIndex + 1) % 2;
-  }
-  gameState.currentPlayerIndex = nextIndex;
-  gameState.currentPlayerTurn = room.players[gameState.currentPlayerIndex].id;
-  gameState.winner = null;
+  Object.assign(gameState, {
+    word: word.toLowerCase(),
+    displayWord: Array(word.length).fill("_"),
+    incorrectGuesses: [],
+    correctGuesses: [],
+    isRoundActive: true,
+    isGameOver: false,
+    winner: null,
+    currentPlayerIndex: currentPlayerIndex,
+    currentPlayerTurn: room.players[currentPlayerIndex].id,
+  });
 
   io.to(roomId).emit("game:new_round");
-  setHangmanTurnTimer(roomId); // Start timer for the first player
+  setHangmanTurnTimer(roomId);
+
   io.to(roomId).emit("game:state", {
     gameType: "hangman",
-    ...gameState,
+    ...getSerializableGameState(gameState),
     players: room.players,
     creatorId: room.creatorId,
   });
@@ -679,12 +650,11 @@ function startNewHangmanRound(roomId) {
 
 function handleHangmanGuess(socket, user, room, letter, gameState) {
   if (gameState.turnTimer) clearTimeout(gameState.turnTimer);
-  gameState.turnEndTime = null;
 
   const cleanedLetter = letter.trim().toLowerCase();
   if (cleanedLetter.length !== 1 || !/^[a-z]$/.test(cleanedLetter)) {
     socket.emit("rate limit", "Please guess a single letter.");
-    setHangmanTurnTimer(room); // Restart timer for the same player
+    setHangmanTurnTimer(room);
     return;
   }
 
@@ -693,20 +663,19 @@ function handleHangmanGuess(socket, user, room, letter, gameState) {
     gameState.incorrectGuesses.includes(cleanedLetter)
   ) {
     socket.emit("rate limit", `You already guessed '${cleanedLetter}'.`);
-    setHangmanTurnTimer(room); // Restart timer for the same player
+    setHangmanTurnTimer(room);
     return;
   }
 
   const word = gameState.word;
-  let correctGuess = false;
+  let isCorrect = false;
+
   if (word.includes(cleanedLetter)) {
-    correctGuess = true;
+    isCorrect = true;
     gameState.correctGuesses.push(cleanedLetter);
     gameState.displayWord = word
       .split("")
-      .map((char) =>
-        gameState.correctGuesses.includes(char) || char === " " ? char : "_"
-      );
+      .map((char) => (gameState.correctGuesses.includes(char) ? char : "_"));
     io.to(room).emit("chat message", {
       room,
       text: `${
@@ -728,53 +697,92 @@ function handleHangmanGuess(socket, user, room, letter, gameState) {
   const won = !gameState.displayWord.includes("_");
   const lost = gameState.incorrectGuesses.length >= MAX_INCORRECT_GUESSES;
 
-  if (won) {
+  if (won || lost) {
     gameState.isRoundActive = false;
     gameState.isGameOver = true;
-    gameState.winner = user;
-    io.to(room).emit(
-      "game:message",
-      `🎉 ${user.name} won! The word was "${word}".`
-    );
-    setTimeout(() => startNewHangmanRound(room), 5000);
-  } else if (lost) {
-    gameState.isRoundActive = false;
-    gameState.isGameOver = true;
-    io.to(room).emit("game:message", `😥 Game over! The word was "${word}".`);
+    gameState.winner = won ? user : null;
+    gameState.lastWinnerIndex = won
+      ? gameState.currentPlayerIndex
+      : (gameState.currentPlayerIndex + 1) % 2;
+
+    const message = won
+      ? `🎉 ${user.name} won! The word was "${word}".`
+      : `😥 Game over! The word was "${word}".`;
+    io.to(room).emit("game:message", message);
     setTimeout(() => startNewHangmanRound(room), 5000);
   } else {
-    // Game is not over, so determine the next turn.
-    if (correctGuess) {
-      // Player guessed correctly, so it's their turn again.
-      // We don't change the currentPlayerTurn or currentPlayerIndex.
-      io.to(room).emit("chat message", {
-        room,
-        text: `${user.name} guessed correctly! They get to go again.`,
-        name: "System",
-      });
-    } else {
-      // Player guessed incorrectly, so switch to the other player.
+    if (!isCorrect) {
       const currentRoom = activeGameRooms[room];
-      if (currentRoom && currentRoom.players.length > 0) {
-        gameState.currentPlayerIndex =
-          (gameState.currentPlayerIndex + 1) % currentRoom.players.length;
-        gameState.currentPlayerTurn =
-          currentRoom.players[gameState.currentPlayerIndex].id;
-        const nextPlayer = users[gameState.currentPlayerTurn];
-        io.to(room).emit("chat message", {
-          room,
-          text: `Incorrect. It's now ${
-            nextPlayer ? nextPlayer.name : "the other player"
-          }'s turn.`,
-          name: "System",
-        });
-      }
+      gameState.currentPlayerIndex =
+        (gameState.currentPlayerIndex + 1) % currentRoom.players.length;
+      gameState.currentPlayerTurn =
+        currentRoom.players[gameState.currentPlayerIndex].id;
     }
-    // Set the timer for the next turn.
     setHangmanTurnTimer(room);
   }
-  // Send the updated state to all players.
-  io.to(room).emit("game:state", { gameType: "hangman", ...gameState });
+
+  io.to(room).emit("game:state", {
+    gameType: "hangman",
+    ...getSerializableGameState(gameState),
+  });
+}
+
+function setHangmanTurnTimer(roomId) {
+  const gameState = gameStates[roomId];
+  if (!gameState || !gameState.isRoundActive) return;
+
+  if (gameState.turnTimer) clearTimeout(gameState.turnTimer);
+
+  gameState.turnEndTime = Date.now() + HANGMAN_TURN_TIME;
+  gameState.turnTimer = setTimeout(
+    () => handleHangmanTimeout(roomId),
+    HANGMAN_TURN_TIME
+  );
+
+  io.to(roomId).emit("game:state", {
+    gameType: "hangman",
+    ...getSerializableGameState(gameState),
+  });
+}
+
+function handleHangmanTimeout(roomId) {
+  const gameState = gameStates[roomId];
+  if (!gameState || !gameState.isRoundActive) return;
+
+  const timedOutPlayer = users[gameState.currentPlayerTurn];
+  io.to(roomId).emit("chat message", {
+    room: roomId,
+    text: `${
+      timedOutPlayer ? timedOutPlayer.name : "Player"
+    }'s turn timed out.`,
+    name: "System",
+  });
+
+  gameState.incorrectGuesses.push(" ");
+
+  const lost = gameState.incorrectGuesses.length >= MAX_INCORRECT_GUESSES;
+
+  if (lost) {
+    gameState.isRoundActive = false;
+    gameState.isGameOver = true;
+    io.to(roomId).emit(
+      "game:message",
+      `😥 Game over! The word was "${gameState.word}".`
+    );
+    gameState.lastWinnerIndex = (gameState.currentPlayerIndex + 1) % 2;
+    setTimeout(() => startNewHangmanRound(roomId), 5000);
+  } else {
+    const currentRoom = activeGameRooms[roomId];
+    gameState.currentPlayerIndex =
+      (gameState.currentPlayerIndex + 1) % currentRoom.players.length;
+    gameState.currentPlayerTurn =
+      currentRoom.players[gameState.currentPlayerIndex].id;
+    setHangmanTurnTimer(roomId);
+  }
+  io.to(roomId).emit("game:state", {
+    gameType: "hangman",
+    ...getSerializableGameState(gameState),
+  });
 }
 
 // --- SERVER START ---
