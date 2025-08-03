@@ -25,6 +25,10 @@ const chatHistory = {};
 const messageSenders = {};
 const gameStates = {};
 let activeGameRooms = {};
+const activeCalls = {}; // Tracks active call pairs { user1Id: user2Id, user2Id: user1Id }
+const pendingPrivateRequests = {}; // Tracks pending requests { requesterId: targetId }
+const acceptedChats = new Set(); // Stores pairs of users who have accepted chat requests, e.g., 'user1id-user2id' (sorted)
+const declinedChats = new Set(); // Stores pairs who have declined, e.g., 'declinerId-requesterId'
 
 // --- GAME CONSTANTS ---
 const DOODLE_WORDS = [
@@ -174,7 +178,6 @@ function handlePlayerLeave(socketId, roomId) {
         room.gameType === "hangman" &&
         gameState.currentPlayerTurn === socketId
       ) {
-        // The current player left, end the game as Hangman is 2-player only.
         io.to(roomId).emit(
           "game:message",
           "A player left. The Hangman game has ended."
@@ -217,6 +220,13 @@ io.on("connection", (socket) => {
   });
 
   socket.on("join room", (roomName) => {
+    if (!roomName.startsWith("game-")) {
+      socket.rooms.forEach((room) => {
+        if (room !== socket.id && !acceptedChats.has(room)) {
+          socket.leave(room);
+        }
+      });
+    }
     socket.join(roomName);
     if (chatHistory[roomName]) {
       socket.emit(
@@ -252,6 +262,7 @@ io.on("connection", (socket) => {
     if (
       gameState &&
       gameState.isRoundActive &&
+      roomData &&
       roomData.gameType === "doodle"
     ) {
       handleDoodleGuess(socket, user, room, text, gameState);
@@ -292,6 +303,147 @@ io.on("connection", (socket) => {
   socket.on("stop typing", ({ room }) => {
     const user = users[socket.id];
     if (user) socket.to(room).emit("stop typing", { name: user.name, room });
+  });
+
+  // --- PRIVATE CHAT REQUESTS ---
+  socket.on("private:initiate", ({ targetId }) => {
+    const requester = users[socket.id];
+    const target = users[targetId];
+
+    if (!requester || !target) {
+      return socket.emit("private:request_error", "User not found.");
+    }
+
+    const privateRoomId = [socket.id, targetId].sort().join("-");
+    const declineKey = `${targetId}-${socket.id}`;
+
+    if (declinedChats.has(declineKey)) {
+      return socket.emit(
+        "private:request_error",
+        `${target.name} has declined your recent request. They must initiate the next chat.`
+      );
+    }
+
+    if (acceptedChats.has(privateRoomId)) {
+      const roomInfo = { id: privateRoomId, name: `Private Chat` };
+      io.to(socket.id).emit("private:request_accepted", {
+        room: roomInfo,
+        withUser: target,
+      });
+      return;
+    }
+
+    if (
+      pendingPrivateRequests[socket.id] ||
+      Object.values(pendingPrivateRequests).includes(socket.id)
+    ) {
+      return socket.emit(
+        "private:request_error",
+        "You already have a pending request."
+      );
+    }
+    pendingPrivateRequests[socket.id] = targetId;
+    io.to(targetId).emit("private:request_incoming", { fromUser: requester });
+  });
+
+  socket.on("private:accept", ({ requesterId }) => {
+    const accepter = users[socket.id];
+    const requester = users[requesterId];
+
+    if (
+      !accepter ||
+      !requester ||
+      pendingPrivateRequests[requesterId] !== socket.id
+    ) {
+      return;
+    }
+
+    delete pendingPrivateRequests[requesterId];
+
+    const privateRoomId = [requesterId, socket.id].sort().join("-");
+    acceptedChats.add(privateRoomId);
+
+    const declineKey1 = `${socket.id}-${requesterId}`;
+    const declineKey2 = `${requesterId}-${socket.id}`;
+    declinedChats.delete(declineKey1);
+    declinedChats.delete(declineKey2);
+
+    const roomInfo = { id: privateRoomId, name: `Private Chat` };
+
+    io.to(requesterId).emit("private:request_accepted", {
+      room: roomInfo,
+      withUser: accepter,
+    });
+    io.to(socket.id).emit("private:request_accepted", {
+      room: roomInfo,
+      withUser: requester,
+    });
+  });
+
+  socket.on("private:decline", ({ requesterId, reason }) => {
+    const decliner = users[socket.id];
+    if (!decliner || !users[requesterId]) return;
+
+    if (pendingPrivateRequests[requesterId] === socket.id) {
+      delete pendingPrivateRequests[requesterId];
+    }
+
+    const declineKey = `${socket.id}-${requesterId}`;
+    declinedChats.add(declineKey);
+
+    io.to(requesterId).emit("private:request_declined", {
+      byUser: decliner,
+      reason,
+    });
+  });
+
+  socket.on("private:leave", ({ room }) => {
+    const user = users[socket.id];
+    if (user) {
+      socket
+        .to(room)
+        .emit("private:partner_left", { room, partnerName: user.name });
+    }
+    socket.leave(room);
+    acceptedChats.delete(room);
+  });
+
+  // --- AUDIO CALL (WEBRTC) SIGNALING EVENTS ---
+  socket.on("call:offer", ({ targetId, offer }) => {
+    const caller = users[socket.id];
+    if (caller && users[targetId]) {
+      io.to(targetId).emit("call:incoming", {
+        from: { id: socket.id, name: caller.name },
+        offer,
+      });
+      activeCalls[socket.id] = targetId;
+      activeCalls[targetId] = socket.id;
+    }
+  });
+
+  socket.on("call:answer", ({ targetId, answer }) => {
+    io.to(targetId).emit("call:answer_received", { from: socket.id, answer });
+  });
+
+  socket.on("call:ice_candidate", ({ targetId, candidate }) => {
+    io.to(targetId).emit("call:ice_candidate_received", {
+      from: socket.id,
+      candidate,
+    });
+  });
+
+  socket.on("call:decline", ({ targetId, reason }) => {
+    io.to(targetId).emit("call:declined", { from: { id: socket.id }, reason });
+    delete activeCalls[socket.id];
+    delete activeCalls[targetId];
+  });
+
+  socket.on("call:end", ({ targetId }) => {
+    if (users[targetId]) {
+      io.to(targetId).emit("call:ended", { from: socket.id });
+    }
+    delete activeCalls[socket.id];
+    delete activeCalls[targetId];
   });
 
   // --- GAME EVENTS ---
@@ -478,7 +630,53 @@ io.on("connection", (socket) => {
       for (const roomId in activeGameRooms) {
         handlePlayerLeave(socket.id, roomId);
       }
+      // Handle leaving private chats on disconnect
+      for (const room of acceptedChats) {
+        if (room.includes(socket.id)) {
+          socket
+            .to(room)
+            .emit("private:partner_left", { room, partnerName: user.name });
+          acceptedChats.delete(room);
+        }
+      }
     }
+
+    if (pendingPrivateRequests[socket.id]) {
+      delete pendingPrivateRequests[socket.id];
+    }
+    for (const requesterId in pendingPrivateRequests) {
+      if (pendingPrivateRequests[requesterId] === socket.id) {
+        io.to(requesterId).emit("private:request_declined", {
+          byUser: { name: user ? user.name : "A user" },
+          reason: "offline",
+        });
+        delete pendingPrivateRequests[requesterId];
+      }
+    }
+
+    const chatPairsToRemove = [];
+    for (const pair of acceptedChats) {
+      if (pair.includes(socket.id)) {
+        chatPairsToRemove.push(pair);
+      }
+    }
+    chatPairsToRemove.forEach((pair) => acceptedChats.delete(pair));
+
+    const declinedPairsToRemove = [];
+    for (const pair of declinedChats) {
+      if (pair.includes(socket.id)) {
+        declinedPairsToRemove.push(pair);
+      }
+    }
+    declinedPairsToRemove.forEach((pair) => declinedChats.delete(pair));
+
+    const otherUserId = activeCalls[socket.id];
+    if (otherUserId) {
+      io.to(otherUserId).emit("call:ended", { from: socket.id });
+      delete activeCalls[socket.id];
+      delete activeCalls[otherUserId];
+    }
+
     delete users[socket.id];
     delete userMessageTimestamps[socket.id];
     io.emit("user list", Object.values(users));
@@ -593,17 +791,8 @@ function startNewDoodleRound(roomId) {
 }
 
 // --- HANGMAN LOGIC ---
-
-/**
- * Creates a "clean" version of the game state that is safe to send over Socket.IO.
- * This prevents "Maximum call stack size exceeded" errors by removing circular references.
- * @param {object} gameState The original game state object.
- * @returns {object} A new object that is safe to serialize and emit.
- */
 function getSerializableGameState(gameState) {
   const stateToSend = { ...gameState };
-  // The 'turnTimer' is a complex Node.js Timeout object with circular references.
-  // It cannot be serialized and sent over the network, so we must remove it.
   delete stateToSend.turnTimer;
   return stateToSend;
 }
@@ -627,9 +816,11 @@ function startNewHangmanRound(roomId) {
 
   Object.assign(gameState, {
     word: word.toLowerCase(),
-    displayWord: Array(word.length).fill("_"),
+    displayWord: Array(word.length)
+      .fill("_")
+      .map((c, i) => (word[i] === " " ? " " : "_")),
     incorrectGuesses: [],
-    correctGuesses: [],
+    correctGuesses: word.includes(" ") ? [" "] : [],
     isRoundActive: true,
     isGameOver: false,
     winner: null,
