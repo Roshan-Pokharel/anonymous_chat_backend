@@ -412,8 +412,6 @@ io.on("connection", (socket) => {
   });
 
   // --- AUDIO CALL (WEBRTC) SIGNALING EVENTS ---
-  // This section is updated to be more robust against race conditions and invalid states.
-
   socket.on("call:offer", ({ targetId, offer }) => {
     const caller = users[socket.id];
     if (!caller || !users[targetId]) {
@@ -423,15 +421,9 @@ io.on("connection", (socket) => {
       return;
     }
 
-    // If the caller is already in a call with someone else, they can't make a new call.
-    if (activeCalls[socket.id] && activeCalls[socket.id] !== targetId) {
-      console.log(
-        `❌ Caller ${socket.id} is already in a call and cannot call ${targetId}.`
-      );
-      return; // Silently fail as the caller's UI should prevent this.
-    }
+    // --- REVISED LOGIC FOR ROBUST CALL HANDLING ---
 
-    // If the target is busy with someone else, decline the call.
+    // If the target is in a call with SOMEONE ELSE, they are busy.
     if (activeCalls[targetId] && activeCalls[targetId] !== socket.id) {
       console.log(
         `❌ Target ${targetId} is busy. Declining call from ${socket.id}.`
@@ -443,20 +435,11 @@ io.on("connection", (socket) => {
       return;
     }
 
-    // If a call is already established or being established, this might be a renegotiation.
-    // The previous client code sends a new offer on renegotiation, which we want to prevent
-    // from triggering a new 'incoming call' modal. For now, we'll just log it and prevent a new call.
-    // A more advanced implementation would handle renegotiation explicitly.
-    if (activeCalls[socket.id] === targetId) {
-      console.log(
-        `⚠️ Ignoring duplicate offer from ${socket.id} to ${targetId} as a call is already active/pending.`
-      );
-      // This prevents the second "call:incoming" event that causes the "busy" decline on the client.
-      return;
-    }
-
-    // This is a valid new call attempt.
-    console.log(`📞 Relaying NEW call offer from ${socket.id} to ${targetId}`);
+    // It's safe to relay the offer. The client will determine if it's a new call or renegotiation.
+    // We also set the active call state here. It's safe to set it multiple times.
+    console.log(
+      `📞 Relaying call offer from ${caller.name} (${socket.id}) to ${users[targetId].name} (${targetId})`
+    );
     activeCalls[socket.id] = targetId;
     activeCalls[targetId] = socket.id;
 
