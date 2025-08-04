@@ -2,14 +2,17 @@ const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const cors = require("cors");
+const path = require("path");
 const { randomUUID } = require("crypto");
 
 const app = express();
 const server = http.createServer(app);
 
 // --- CORS Configuration ---
+// FIX: Explicitly allow your Vercel frontend URL.
+// This is the key change that will fix the connection error.
 const corsOptions = {
-  origin: "*",
+  origin: "https://anonymous-chat-frontend-gray.vercel.app",
   methods: ["GET", "POST"],
 };
 
@@ -903,7 +906,7 @@ function handleHangmanGuess(socket, user, room, letter, gameState) {
     setTimeout(() => startNewHangmanRound(room), 5000);
   } else {
     if (!isCorrect) {
-      const currentRoom = activeGameRooms[room];
+      const currentRoom = activeGameRooms[roomId];
       gameState.currentPlayerIndex =
         (gameState.currentPlayerIndex + 1) % currentRoom.players.length;
       gameState.currentPlayerTurn =
@@ -977,6 +980,7 @@ function handleHangmanTimeout(roomId) {
 }
 
 // --- SERVER START ---
+// Add a route for the root to check if the server is running
 app.get("/", (req, res) => {
   res.send("✅ Anonymous Chat & Games Backend is running smoothly.");
 });
