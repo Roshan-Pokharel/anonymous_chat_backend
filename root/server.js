@@ -9,8 +9,7 @@ const app = express();
 const server = http.createServer(app);
 
 // --- CORS Configuration ---
-// FIX: Explicitly allow your Vercel frontend URL.
-// This is the key change that will fix the connection error.
+// CRITICAL: This origin URL MUST EXACTLY MATCH your Vercel frontend URL.
 const corsOptions = {
   origin: "https://anonymous-chat-frontend-gray.vercel.app",
   methods: ["GET", "POST"],
@@ -414,6 +413,7 @@ io.on("connection", (socket) => {
   // --- AUDIO CALL (WEBRTC) SIGNALING EVENTS ---
   socket.on("call:offer", ({ targetId, offer }) => {
     const caller = users[socket.id];
+    console.log(`📞 Relaying call offer from ${socket.id} to ${targetId}`);
     if (caller && users[targetId]) {
       io.to(targetId).emit("call:incoming", {
         from: { id: socket.id, name: caller.name },
@@ -425,10 +425,12 @@ io.on("connection", (socket) => {
   });
 
   socket.on("call:answer", ({ targetId, answer }) => {
+    console.log(`✅ Relaying call answer from ${socket.id} to ${targetId}`);
     io.to(targetId).emit("call:answer_received", { from: socket.id, answer });
   });
 
   socket.on("call:ice_candidate", ({ targetId, candidate }) => {
+    // console.log(`🧊 Relaying ICE candidate from ${socket.id} to ${targetId}`); // This can be very noisy
     io.to(targetId).emit("call:ice_candidate_received", {
       from: socket.id,
       candidate,
@@ -436,12 +438,14 @@ io.on("connection", (socket) => {
   });
 
   socket.on("call:decline", ({ targetId, reason }) => {
+    console.log(`❌ Relaying call decline from ${socket.id} to ${targetId}`);
     io.to(targetId).emit("call:declined", { from: { id: socket.id }, reason });
     delete activeCalls[socket.id];
     delete activeCalls[targetId];
   });
 
   socket.on("call:end", ({ targetId }) => {
+    console.log(`☎️ Relaying call end from ${socket.id} to ${targetId}`);
     if (users[targetId]) {
       io.to(targetId).emit("call:ended", { from: socket.id });
     }
@@ -467,6 +471,7 @@ io.on("connection", (socket) => {
     activeGameRooms[roomId] = newRoom;
     socket.join(roomId);
     socket.emit("game:joined", newRoom);
+    io.emit("game:roomsList", getPublicRoomList());
     io.to(roomId).emit("game:state", {
       gameType: newRoom.gameType,
       players: newRoom.players,
