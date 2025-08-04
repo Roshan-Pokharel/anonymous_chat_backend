@@ -30,10 +30,7 @@ const acceptedChats = new Set();
 const declinedChats = new Set();
 
 // --- REVISED CALL STATE MANAGEMENT ---
-// This object will now manage the state of each user in a call more granularly
-// to prevent race conditions (glare).
-// Possible states: 'idle', 'offering', 'receiving', 'connected'
-const callStates = {};
+const callStates = {}; // { userId: { status: 'idle'|'offering'|'receiving'|'connected', partnerId: '...' } }
 
 // --- GAME CONSTANTS ---
 const DOODLE_WORDS = [
@@ -134,10 +131,8 @@ function getPublicRoomList() {
 function handlePlayerLeave(socketId, roomId) {
   const room = activeGameRooms[roomId];
   if (!room) return;
-
   const playerIndex = room.players.findIndex((p) => p.id === socketId);
   if (playerIndex === -1) return;
-
   const departingPlayer = room.players[playerIndex];
   room.players.splice(playerIndex, 1);
   io.to(roomId).emit("chat message", {
@@ -145,10 +140,8 @@ function handlePlayerLeave(socketId, roomId) {
     text: `${departingPlayer.name} has left the game.`,
     name: "System",
   });
-
   const gameState = gameStates[roomId];
   const minPlayers = room.gameType === "doodle" ? 2 : 2;
-
   if (room.players.length < minPlayers) {
     if (gameState && gameState.isRoundActive) {
       if (gameState.roundTimer) clearTimeout(gameState.roundTimer);
@@ -170,7 +163,6 @@ function handlePlayerLeave(socketId, roomId) {
         `${room.creatorName} is the new host.`
       );
     }
-
     if (gameState && gameState.isRoundActive) {
       if (room.gameType === "doodle" && gameState.drawer.id === socketId) {
         io.to(roomId).emit(
@@ -211,9 +203,8 @@ io.on("connection", (socket) => {
   console.log("🟢 User connected:", socket.id);
   socket.join("public");
   userMessageTimestamps[socket.id] = [];
-  callStates[socket.id] = { status: "idle", partnerId: null }; // Initialize call state
+  callStates[socket.id] = { status: "idle", partnerId: null };
 
-  // ... (user info, join room, chat message, etc. remain the same)
   socket.on("user info", ({ nickname, gender, age }) => {
     if (
       typeof nickname !== "string" ||
@@ -252,7 +243,6 @@ io.on("connection", (socket) => {
       text.length > 500
     )
       return;
-
     const now = Date.now();
     userMessageTimestamps[socket.id] = (
       userMessageTimestamps[socket.id] || []
@@ -262,10 +252,8 @@ io.on("connection", (socket) => {
       return;
     }
     userMessageTimestamps[socket.id].push(now);
-
     const gameState = gameStates[room];
     const roomData = activeGameRooms[room];
-
     if (
       gameState &&
       gameState.isRoundActive &&
@@ -275,7 +263,6 @@ io.on("connection", (socket) => {
       handleDoodleGuess(socket, user, room, text, gameState);
       return;
     }
-
     const messageId = `${Date.now()}-${socket.id}`;
     const msg = {
       id: socket.id,
@@ -312,25 +299,20 @@ io.on("connection", (socket) => {
     if (user) socket.to(room).emit("stop typing", { name: user.name, room });
   });
 
-  // ... (private chat requests logic remains the same)
   socket.on("private:initiate", ({ targetId }) => {
     const requester = users[socket.id];
     const target = users[targetId];
-
     if (!requester || !target) {
       return socket.emit("private:request_error", "User not found.");
     }
-
     const privateRoomId = [socket.id, targetId].sort().join("-");
     const declineKey = `${targetId}-${socket.id}`;
-
     if (declinedChats.has(declineKey)) {
       return socket.emit(
         "private:request_error",
         `${target.name} has declined your recent request. They must initiate the next chat.`
       );
     }
-
     if (acceptedChats.has(privateRoomId)) {
       const roomInfo = { id: privateRoomId, name: `Private Chat` };
       io.to(socket.id).emit("private:request_accepted", {
@@ -339,7 +321,6 @@ io.on("connection", (socket) => {
       });
       return;
     }
-
     if (
       pendingPrivateRequests[socket.id] ||
       Object.values(pendingPrivateRequests).includes(socket.id)
@@ -356,7 +337,6 @@ io.on("connection", (socket) => {
   socket.on("private:accept", ({ requesterId }) => {
     const accepter = users[socket.id];
     const requester = users[requesterId];
-
     if (
       !accepter ||
       !requester ||
@@ -364,19 +344,14 @@ io.on("connection", (socket) => {
     ) {
       return;
     }
-
     delete pendingPrivateRequests[requesterId];
-
     const privateRoomId = [requesterId, socket.id].sort().join("-");
     acceptedChats.add(privateRoomId);
-
     const declineKey1 = `${socket.id}-${requesterId}`;
     const declineKey2 = `${requesterId}-${socket.id}`;
     declinedChats.delete(declineKey1);
     declinedChats.delete(declineKey2);
-
     const roomInfo = { id: privateRoomId, name: `Private Chat` };
-
     io.to(requesterId).emit("private:request_accepted", {
       room: roomInfo,
       withUser: accepter,
@@ -390,14 +365,11 @@ io.on("connection", (socket) => {
   socket.on("private:decline", ({ requesterId, reason }) => {
     const decliner = users[socket.id];
     if (!decliner || !users[requesterId]) return;
-
     if (pendingPrivateRequests[requesterId] === socket.id) {
       delete pendingPrivateRequests[requesterId];
     }
-
     const declineKey = `${socket.id}-${requesterId}`;
     declinedChats.add(declineKey);
-
     io.to(requesterId).emit("private:request_declined", {
       byUser: decliner,
       reason,
@@ -415,10 +387,10 @@ io.on("connection", (socket) => {
     acceptedChats.delete(room);
   });
 
-  // --- REVISED AUDIO CALL (WEBRTC) SIGNALING ---
-
+  // --- STATEFUL AUDIO CALL (WEBRTC) SIGNALING ---
   function resetCallState(userId) {
     if (callStates[userId]) {
+      console.log(`[State] Resetting call state for ${userId}`);
       callStates[userId].status = "idle";
       callStates[userId].partnerId = null;
     }
@@ -427,15 +399,10 @@ io.on("connection", (socket) => {
   socket.on("call:offer", ({ targetId, offer }) => {
     const caller = users[socket.id];
     const target = users[targetId];
-
     if (!caller || !target) return;
 
-    // Prevent making a call if caller or target is already busy
     if (callStates[socket.id]?.status !== "idle") {
-      return socket.emit(
-        "call:error",
-        "You are already in a call or calling someone."
-      );
+      return socket.emit("call:error", "You are already in a call process.");
     }
     if (callStates[targetId]?.status !== "idle") {
       return socket.emit("call:busy", {
@@ -443,14 +410,9 @@ io.on("connection", (socket) => {
       });
     }
 
-    console.log(
-      `📞 [Stateful] Offer from ${caller.name} (${socket.id}) to ${target.name} (${targetId})`
-    );
-
-    // Set states to prevent glare
+    console.log(`📞 [Stateful] Offer from ${caller.name} to ${target.name}`);
     callStates[socket.id] = { status: "offering", partnerId: targetId };
     callStates[targetId] = { status: "receiving", partnerId: socket.id };
-
     io.to(targetId).emit("call:incoming", {
       from: { id: socket.id, name: caller.name },
       offer,
@@ -460,27 +422,21 @@ io.on("connection", (socket) => {
   socket.on("call:answer", ({ targetId, answer }) => {
     const caller = users[targetId];
     const callee = users[socket.id];
-
     if (
       !caller ||
       !callee ||
       callStates[socket.id]?.partnerId !== targetId ||
       callStates[targetId]?.partnerId !== socket.id
-    ) {
+    )
       return;
-    }
 
     console.log(`✅ [Stateful] Answer from ${callee.name} to ${caller.name}`);
-
-    // Both parties are now connected
     callStates[socket.id].status = "connected";
     callStates[targetId].status = "connected";
-
     io.to(targetId).emit("call:answer_received", { from: socket.id, answer });
   });
 
   socket.on("call:ice_candidate", ({ targetId, candidate }) => {
-    // Only relay candidates if they are in a call process with each other
     if (callStates[socket.id]?.partnerId === targetId) {
       io.to(targetId).emit("call:ice_candidate_received", {
         from: socket.id,
@@ -492,15 +448,11 @@ io.on("connection", (socket) => {
   socket.on("call:decline", ({ targetId, reason }) => {
     const decliner = users[socket.id];
     if (!decliner) return;
-
     console.log(`❌ [Stateful] Call declined by ${decliner.name}`);
-
     io.to(targetId).emit("call:declined", {
       from: { id: socket.id, name: decliner.name },
       reason,
     });
-
-    // Reset states for both users
     resetCallState(socket.id);
     resetCallState(targetId);
   });
@@ -513,11 +465,9 @@ io.on("connection", (socket) => {
     console.log(
       `☎️ [Stateful] Call ended by ${enderId}. Notifying ${partnerId}`
     );
-
     if (partnerId && users[partnerId]) {
       io.to(partnerId).emit("call:ended", { from: enderId });
     }
-
     resetCallState(enderId);
     if (partnerId) {
       resetCallState(partnerId);
@@ -528,7 +478,7 @@ io.on("connection", (socket) => {
     endCallCleanup(socket.id);
   });
 
-  // ... (game events logic remains the same)
+  // --- GAME EVENTS (Unchanged) ---
   socket.on("game:create", ({ roomName, password, gameType }) => {
     const user = users[socket.id];
     if (!user) return;
@@ -555,7 +505,6 @@ io.on("connection", (socket) => {
       scores: {},
     });
   });
-
   socket.on("game:join", ({ roomId, password }) => {
     const user = users[socket.id];
     const room = activeGameRooms[roomId];
@@ -576,7 +525,6 @@ io.on("connection", (socket) => {
       );
       return;
     }
-
     room.players.push(user);
     socket.join(roomId);
     socket.emit("game:joined", room);
@@ -598,17 +546,14 @@ io.on("connection", (socket) => {
     }
     io.emit("game:roomsList", getPublicRoomList());
   });
-
   socket.on("game:leave", (roomId) => {
     socket.leave(roomId);
     handlePlayerLeave(socket.id, roomId);
   });
-
   socket.on("game:start", (roomId) => {
     const room = activeGameRooms[roomId];
     const user = users[socket.id];
     if (!room || !user || user.id !== room.creatorId) return;
-
     if (room.gameType === "hangman" && room.players.length !== 2) {
       socket.emit(
         "game:message",
@@ -623,7 +568,6 @@ io.on("connection", (socket) => {
       );
       return;
     }
-
     room.inProgress = true;
     if (room.gameType === "doodle") {
       const initialScores = {};
@@ -650,12 +594,10 @@ io.on("connection", (socket) => {
     }
     io.emit("game:roomsList", getPublicRoomList());
   });
-
   socket.on("game:stop", (roomId) => {
     const room = activeGameRooms[roomId];
     const user = users[socket.id];
     if (!room || !user || user.id !== room.creatorId) return;
-
     io.to(roomId).emit("game:terminated", "The host has terminated the game.");
     const socketsInRoom = io.sockets.adapter.rooms.get(roomId);
     if (socketsInRoom) {
@@ -667,7 +609,6 @@ io.on("connection", (socket) => {
     delete gameStates[roomId];
     io.emit("game:roomsList", getPublicRoomList());
   });
-
   socket.on("game:draw", ({ room, data }) => {
     const gameState = gameStates[room];
     if (
@@ -679,7 +620,6 @@ io.on("connection", (socket) => {
       socket.to(room).emit("game:draw", data);
     }
   });
-
   socket.on("game:clear_canvas", (room) => {
     const gameState = gameStates[room];
     if (gameState && gameState.drawer.id === socket.id) {
@@ -687,7 +627,6 @@ io.on("connection", (socket) => {
       io.to(room).emit("game:clear_canvas");
     }
   });
-
   socket.on("hangman:guess", ({ room, letter }) => {
     const user = users[socket.id];
     const gameState = gameStates[room];
@@ -707,10 +646,7 @@ io.on("connection", (socket) => {
 
   socket.on("disconnect", () => {
     console.log("🔴 User disconnected:", socket.id);
-
-    // Handle call cleanup on disconnect
     endCallCleanup(socket.id);
-
     const user = users[socket.id];
     if (user) {
       for (const roomId in activeGameRooms) {
@@ -725,7 +661,6 @@ io.on("connection", (socket) => {
         }
       }
     }
-
     if (pendingPrivateRequests[socket.id]) {
       delete pendingPrivateRequests[socket.id];
     }
@@ -738,27 +673,24 @@ io.on("connection", (socket) => {
         delete pendingPrivateRequests[requesterId];
       }
     }
-
     const chatPairsToRemove = [];
     for (const pair of acceptedChats) {
       if (pair.includes(socket.id)) chatPairsToRemove.push(pair);
     }
     chatPairsToRemove.forEach((pair) => acceptedChats.delete(pair));
-
     const declinedPairsToRemove = [];
     for (const pair of declinedChats) {
       if (pair.includes(socket.id)) declinedPairsToRemove.push(pair);
     }
     declinedPairsToRemove.forEach((pair) => declinedChats.delete(pair));
-
     delete users[socket.id];
     delete userMessageTimestamps[socket.id];
-    delete callStates[socket.id]; // Clean up call state
+    delete callStates[socket.id];
     io.emit("user list", Object.values(users));
   });
 });
 
-// ... (Doodle Dash and Hangman logic functions remain the same)
+// --- Game Logic Functions (Unchanged) ---
 function handleDoodleGuess(socket, user, room, text, gameState) {
   if (socket.id === gameState.drawer.id) {
     socket.emit("rate limit", "You cannot chat while drawing.");
@@ -802,7 +734,6 @@ function handleDoodleGuess(socket, user, room, text, gameState) {
     io.to(room).emit("chat message", msg);
   }
 }
-
 function startNewDoodleRound(roomId) {
   const gameState = gameStates[roomId];
   const room = activeGameRooms[roomId];
@@ -864,13 +795,11 @@ function startNewDoodleRound(roomId) {
   });
   io.to(drawerId).emit("game:word_prompt", word);
 }
-
 function getSerializableGameState(gameState) {
   const stateToSend = { ...gameState };
   delete stateToSend.turnTimer;
   return stateToSend;
 }
-
 function startNewHangmanRound(roomId) {
   const room = activeGameRooms[roomId];
   const gameState = gameStates[roomId];
@@ -880,14 +809,12 @@ function startNewHangmanRound(roomId) {
     io.emit("game:roomsList", getPublicRoomList());
     return;
   }
-
   const word = HANGMAN_WORDS[Math.floor(Math.random() * HANGMAN_WORDS.length)];
   const lastWinnerIndex = gameState.lastWinnerIndex;
   let currentPlayerIndex =
     typeof lastWinnerIndex === "number"
       ? (lastWinnerIndex + 1) % 2
       : Math.floor(Math.random() * 2);
-
   Object.assign(gameState, {
     word: word.toLowerCase(),
     displayWord: Array(word.length)
@@ -901,10 +828,8 @@ function startNewHangmanRound(roomId) {
     currentPlayerIndex: currentPlayerIndex,
     currentPlayerTurn: room.players[currentPlayerIndex].id,
   });
-
   io.to(roomId).emit("game:new_round");
   setHangmanTurnTimer(roomId);
-
   io.to(roomId).emit("game:state", {
     gameType: "hangman",
     ...getSerializableGameState(gameState),
@@ -912,17 +837,14 @@ function startNewHangmanRound(roomId) {
     creatorId: room.creatorId,
   });
 }
-
 function handleHangmanGuess(socket, user, room, letter, gameState) {
   if (gameState.turnTimer) clearTimeout(gameState.turnTimer);
-
   const cleanedLetter = letter.trim().toLowerCase();
   if (cleanedLetter.length !== 1 || !/^[a-z]$/.test(cleanedLetter)) {
     socket.emit("rate limit", "Please guess a single letter.");
     setHangmanTurnTimer(room);
     return;
   }
-
   if (
     gameState.correctGuesses.includes(cleanedLetter) ||
     gameState.incorrectGuesses.includes(cleanedLetter)
@@ -931,10 +853,8 @@ function handleHangmanGuess(socket, user, room, letter, gameState) {
     setHangmanTurnTimer(room);
     return;
   }
-
   const word = gameState.word;
   let isCorrect = false;
-
   if (word.includes(cleanedLetter)) {
     isCorrect = true;
     gameState.correctGuesses.push(cleanedLetter);
@@ -958,10 +878,8 @@ function handleHangmanGuess(socket, user, room, letter, gameState) {
       name: "System",
     });
   }
-
   const won = !gameState.displayWord.includes("_");
   const lost = gameState.incorrectGuesses.length >= MAX_INCORRECT_GUESSES;
-
   if (won || lost) {
     gameState.isRoundActive = false;
     gameState.isGameOver = true;
@@ -969,7 +887,6 @@ function handleHangmanGuess(socket, user, room, letter, gameState) {
     gameState.lastWinnerIndex = won
       ? gameState.currentPlayerIndex
       : (gameState.currentPlayerIndex + 1) % 2;
-
     const message = won
       ? `🎉 ${user.name} won! The word was "${word}".`
       : `😥 Game over! The word was "${word}".`;
@@ -985,35 +902,28 @@ function handleHangmanGuess(socket, user, room, letter, gameState) {
     }
     setHangmanTurnTimer(room);
   }
-
   io.to(room).emit("game:state", {
     gameType: "hangman",
     ...getSerializableGameState(gameState),
   });
 }
-
 function setHangmanTurnTimer(roomId) {
   const gameState = gameStates[roomId];
   if (!gameState || !gameState.isRoundActive) return;
-
   if (gameState.turnTimer) clearTimeout(gameState.turnTimer);
-
   gameState.turnEndTime = Date.now() + HANGMAN_TURN_TIME;
   gameState.turnTimer = setTimeout(
     () => handleHangmanTimeout(roomId),
     HANGMAN_TURN_TIME
   );
-
   io.to(roomId).emit("game:state", {
     gameType: "hangman",
     ...getSerializableGameState(gameState),
   });
 }
-
 function handleHangmanTimeout(roomId) {
   const gameState = gameStates[roomId];
   if (!gameState || !gameState.isRoundActive) return;
-
   const timedOutPlayer = users[gameState.currentPlayerTurn];
   io.to(roomId).emit("chat message", {
     room: roomId,
@@ -1022,11 +932,8 @@ function handleHangmanTimeout(roomId) {
     }'s turn timed out.`,
     name: "System",
   });
-
   gameState.incorrectGuesses.push(" ");
-
   const lost = gameState.incorrectGuesses.length >= MAX_INCORRECT_GUESSES;
-
   if (lost) {
     gameState.isRoundActive = false;
     gameState.isGameOver = true;
@@ -1035,7 +942,7 @@ function handleHangmanTimeout(roomId) {
       `😥 Game over! The word was "${gameState.word}".`
     );
     gameState.lastWinnerIndex = (gameState.currentPlayerIndex + 1) % 2;
-    setTimeout(() => startNewHangmanRound(roomId), 5000);
+    setTimeout(() => startNewHangmanRound(room), 5000);
   } else {
     const currentRoom = activeGameRooms[roomId];
     gameState.currentPlayerIndex =
@@ -1054,7 +961,6 @@ function handleHangmanTimeout(roomId) {
 app.get("/", (req, res) => {
   res.send("✅ Anonymous Chat & Games Backend is running smoothly.");
 });
-
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`🚀 Server is running on port ${PORT}`);
