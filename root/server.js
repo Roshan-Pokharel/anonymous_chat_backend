@@ -8,11 +8,8 @@ const { randomUUID } = require("crypto");
 const app = express();
 const server = http.createServer(app);
 
-// --- CORS Configuration ---
-// For development, you might use "*". For production, it's best to restrict
-// this to your actual frontend URL for security.
 const corsOptions = {
-  origin: "*", // Using "*" for broad compatibility, but restrict in production
+  origin: "*",
   methods: ["GET", "POST"],
 };
 
@@ -28,10 +25,15 @@ const chatHistory = {};
 const messageSenders = {};
 const gameStates = {};
 let activeGameRooms = {};
-const activeCalls = {}; // Tracks active call pairs { user1Id: user2Id, user2Id: user1Id }
-const pendingPrivateRequests = {}; // Tracks pending requests { requesterId: targetId }
-const acceptedChats = new Set(); // Stores pairs of users who have accepted chat requests, e.g., 'user1id-user2id' (sorted)
-const declinedChats = new Set(); // Stores pairs who have declined, e.g., 'declinerId-requesterId'
+const pendingPrivateRequests = {};
+const acceptedChats = new Set();
+const declinedChats = new Set();
+
+// --- REVISED CALL STATE MANAGEMENT ---
+// This object will now manage the state of each user in a call more granularly
+// to prevent race conditions (glare).
+// Possible states: 'idle', 'offering', 'receiving', 'connected'
+const callStates = {};
 
 // --- GAME CONSTANTS ---
 const DOODLE_WORDS = [
@@ -209,7 +211,9 @@ io.on("connection", (socket) => {
   console.log("🟢 User connected:", socket.id);
   socket.join("public");
   userMessageTimestamps[socket.id] = [];
+  callStates[socket.id] = { status: "idle", partnerId: null }; // Initialize call state
 
+  // ... (user info, join room, chat message, etc. remain the same)
   socket.on("user info", ({ nickname, gender, age }) => {
     if (
       typeof nickname !== "string" ||
@@ -308,7 +312,7 @@ io.on("connection", (socket) => {
     if (user) socket.to(room).emit("stop typing", { name: user.name, room });
   });
 
-  // --- PRIVATE CHAT REQUESTS ---
+  // ... (private chat requests logic remains the same)
   socket.on("private:initiate", ({ targetId }) => {
     const requester = users[socket.id];
     const target = users[targetId];
@@ -411,37 +415,41 @@ io.on("connection", (socket) => {
     acceptedChats.delete(room);
   });
 
-  // --- AUDIO CALL (WEBRTC) SIGNALING EVENTS ---
+  // --- REVISED AUDIO CALL (WEBRTC) SIGNALING ---
+
+  function resetCallState(userId) {
+    if (callStates[userId]) {
+      callStates[userId].status = "idle";
+      callStates[userId].partnerId = null;
+    }
+  }
+
   socket.on("call:offer", ({ targetId, offer }) => {
     const caller = users[socket.id];
-    if (!caller || !users[targetId]) {
-      console.log(
-        `⚠️ Offer failed: Caller ${socket.id} or Target ${targetId} not found.`
+    const target = users[targetId];
+
+    if (!caller || !target) return;
+
+    // Prevent making a call if caller or target is already busy
+    if (callStates[socket.id]?.status !== "idle") {
+      return socket.emit(
+        "call:error",
+        "You are already in a call or calling someone."
       );
-      return;
     }
-
-    // --- REVISED LOGIC FOR ROBUST CALL HANDLING ---
-
-    // If the target is in a call with SOMEONE ELSE, they are busy.
-    if (activeCalls[targetId] && activeCalls[targetId] !== socket.id) {
-      console.log(
-        `❌ Target ${targetId} is busy. Declining call from ${socket.id}.`
-      );
-      socket.emit("call:declined", {
-        from: { id: targetId, name: users[targetId].name },
-        reason: "busy",
+    if (callStates[targetId]?.status !== "idle") {
+      return socket.emit("call:busy", {
+        from: { id: targetId, name: target.name },
       });
-      return;
     }
 
-    // It's safe to relay the offer. The client will determine if it's a new call or renegotiation.
-    // We also set the active call state here. It's safe to set it multiple times.
     console.log(
-      `📞 Relaying call offer from ${caller.name} (${socket.id}) to ${users[targetId].name} (${targetId})`
+      `📞 [Stateful] Offer from ${caller.name} (${socket.id}) to ${target.name} (${targetId})`
     );
-    activeCalls[socket.id] = targetId;
-    activeCalls[targetId] = socket.id;
+
+    // Set states to prevent glare
+    callStates[socket.id] = { status: "offering", partnerId: targetId };
+    callStates[targetId] = { status: "receiving", partnerId: socket.id };
 
     io.to(targetId).emit("call:incoming", {
       from: { id: socket.id, name: caller.name },
@@ -450,59 +458,77 @@ io.on("connection", (socket) => {
   });
 
   socket.on("call:answer", ({ targetId, answer }) => {
-    // Validate that the sender is actually in a call with the target
-    if (activeCalls[socket.id] !== targetId) {
-      console.log(
-        `⚠️ Invalid call answer from ${socket.id} to ${targetId}. No active call found.`
-      );
+    const caller = users[targetId];
+    const callee = users[socket.id];
+
+    if (
+      !caller ||
+      !callee ||
+      callStates[socket.id]?.partnerId !== targetId ||
+      callStates[targetId]?.partnerId !== socket.id
+    ) {
       return;
     }
-    console.log(`✅ Relaying call answer from ${socket.id} to ${targetId}`);
+
+    console.log(`✅ [Stateful] Answer from ${callee.name} to ${caller.name}`);
+
+    // Both parties are now connected
+    callStates[socket.id].status = "connected";
+    callStates[targetId].status = "connected";
+
     io.to(targetId).emit("call:answer_received", { from: socket.id, answer });
   });
 
   socket.on("call:ice_candidate", ({ targetId, candidate }) => {
-    // Validate that the sender is actually in a call with the target
-    if (activeCalls[socket.id] !== targetId) {
-      console.log(
-        `⚠️ Invalid ICE candidate from ${socket.id} to ${targetId}. No active call found.`
-      );
-      return;
+    // Only relay candidates if they are in a call process with each other
+    if (callStates[socket.id]?.partnerId === targetId) {
+      io.to(targetId).emit("call:ice_candidate_received", {
+        from: socket.id,
+        candidate,
+      });
     }
-    // No console log here to prevent flooding the server logs.
-    io.to(targetId).emit("call:ice_candidate_received", {
-      from: socket.id,
-      candidate,
-    });
   });
 
   socket.on("call:decline", ({ targetId, reason }) => {
-    console.log(`❌ Relaying call decline from ${socket.id} to ${targetId}`);
+    const decliner = users[socket.id];
+    if (!decliner) return;
+
+    console.log(`❌ [Stateful] Call declined by ${decliner.name}`);
+
     io.to(targetId).emit("call:declined", {
-      from: { id: socket.id, name: users[socket.id]?.name || "User" },
+      from: { id: socket.id, name: decliner.name },
       reason,
     });
-    // Clean up the call state for both users
-    delete activeCalls[socket.id];
-    delete activeCalls[targetId];
+
+    // Reset states for both users
+    resetCallState(socket.id);
+    resetCallState(targetId);
   });
+
+  const endCallCleanup = (enderId) => {
+    const callState = callStates[enderId];
+    if (!callState || callState.status === "idle") return;
+
+    const partnerId = callState.partnerId;
+    console.log(
+      `☎️ [Stateful] Call ended by ${enderId}. Notifying ${partnerId}`
+    );
+
+    if (partnerId && users[partnerId]) {
+      io.to(partnerId).emit("call:ended", { from: enderId });
+    }
+
+    resetCallState(enderId);
+    if (partnerId) {
+      resetCallState(partnerId);
+    }
+  };
 
   socket.on("call:end", () => {
-    const partnerId = activeCalls[socket.id];
-    console.log(
-      `☎️ Relaying call end from ${socket.id} to partner ${partnerId}`
-    );
-    if (partnerId && users[partnerId]) {
-      io.to(partnerId).emit("call:ended", { from: socket.id });
-    }
-    // Clean up the call state for both users
-    delete activeCalls[socket.id];
-    if (partnerId) {
-      delete activeCalls[partnerId];
-    }
+    endCallCleanup(socket.id);
   });
 
-  // --- GAME EVENTS ---
+  // ... (game events logic remains the same)
   socket.on("game:create", ({ roomName, password, gameType }) => {
     const user = users[socket.id];
     if (!user) return;
@@ -681,12 +707,15 @@ io.on("connection", (socket) => {
 
   socket.on("disconnect", () => {
     console.log("🔴 User disconnected:", socket.id);
+
+    // Handle call cleanup on disconnect
+    endCallCleanup(socket.id);
+
     const user = users[socket.id];
     if (user) {
       for (const roomId in activeGameRooms) {
         handlePlayerLeave(socket.id, roomId);
       }
-      // Handle leaving private chats on disconnect
       for (const room of acceptedChats) {
         if (room.includes(socket.id)) {
           socket
@@ -712,35 +741,24 @@ io.on("connection", (socket) => {
 
     const chatPairsToRemove = [];
     for (const pair of acceptedChats) {
-      if (pair.includes(socket.id)) {
-        chatPairsToRemove.push(pair);
-      }
+      if (pair.includes(socket.id)) chatPairsToRemove.push(pair);
     }
     chatPairsToRemove.forEach((pair) => acceptedChats.delete(pair));
 
     const declinedPairsToRemove = [];
     for (const pair of declinedChats) {
-      if (pair.includes(socket.id)) {
-        declinedPairsToRemove.push(pair);
-      }
+      if (pair.includes(socket.id)) declinedPairsToRemove.push(pair);
     }
     declinedPairsToRemove.forEach((pair) => declinedChats.delete(pair));
 
-    // Handle call cleanup on disconnect
-    const otherUserId = activeCalls[socket.id];
-    if (otherUserId) {
-      io.to(otherUserId).emit("call:ended", { from: socket.id });
-      delete activeCalls[socket.id];
-      delete activeCalls[otherUserId];
-    }
-
     delete users[socket.id];
     delete userMessageTimestamps[socket.id];
+    delete callStates[socket.id]; // Clean up call state
     io.emit("user list", Object.values(users));
   });
 });
 
-// --- DOODLE DASH LOGIC ---
+// ... (Doodle Dash and Hangman logic functions remain the same)
 function handleDoodleGuess(socket, user, room, text, gameState) {
   if (socket.id === gameState.drawer.id) {
     socket.emit("rate limit", "You cannot chat while drawing.");
@@ -847,7 +865,6 @@ function startNewDoodleRound(roomId) {
   io.to(drawerId).emit("game:word_prompt", word);
 }
 
-// --- HANGMAN LOGIC ---
 function getSerializableGameState(gameState) {
   const stateToSend = { ...gameState };
   delete stateToSend.turnTimer;
@@ -1034,7 +1051,6 @@ function handleHangmanTimeout(roomId) {
 }
 
 // --- SERVER START ---
-// Add a route for the root to check if the server is running
 app.get("/", (req, res) => {
   res.send("✅ Anonymous Chat & Games Backend is running smoothly.");
 });
