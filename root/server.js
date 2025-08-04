@@ -412,25 +412,66 @@ io.on("connection", (socket) => {
   });
 
   // --- AUDIO CALL (WEBRTC) SIGNALING EVENTS ---
+  // This section is updated to be more robust against race conditions and invalid states.
+
   socket.on("call:offer", ({ targetId, offer }) => {
     const caller = users[socket.id];
-    console.log(`📞 Relaying call offer from ${socket.id} to ${targetId}`);
-    if (caller && users[targetId]) {
-      // Set up the call relationship
-      activeCalls[socket.id] = targetId;
-      activeCalls[targetId] = socket.id;
-
-      io.to(targetId).emit("call:incoming", {
-        from: { id: socket.id, name: caller.name },
-        offer,
-      });
+    if (!caller || !users[targetId]) {
+      console.log(
+        `⚠️ Offer failed: Caller ${socket.id} or Target ${targetId} not found.`
+      );
+      return;
     }
+
+    // If the caller is already in a call with someone else, they can't make a new call.
+    if (activeCalls[socket.id] && activeCalls[socket.id] !== targetId) {
+      console.log(
+        `❌ Caller ${socket.id} is already in a call and cannot call ${targetId}.`
+      );
+      return; // Silently fail as the caller's UI should prevent this.
+    }
+
+    // If the target is busy with someone else, decline the call.
+    if (activeCalls[targetId] && activeCalls[targetId] !== socket.id) {
+      console.log(
+        `❌ Target ${targetId} is busy. Declining call from ${socket.id}.`
+      );
+      socket.emit("call:declined", {
+        from: { id: targetId, name: users[targetId].name },
+        reason: "busy",
+      });
+      return;
+    }
+
+    // If a call is already established or being established, this might be a renegotiation.
+    // The previous client code sends a new offer on renegotiation, which we want to prevent
+    // from triggering a new 'incoming call' modal. For now, we'll just log it and prevent a new call.
+    // A more advanced implementation would handle renegotiation explicitly.
+    if (activeCalls[socket.id] === targetId) {
+      console.log(
+        `⚠️ Ignoring duplicate offer from ${socket.id} to ${targetId} as a call is already active/pending.`
+      );
+      // This prevents the second "call:incoming" event that causes the "busy" decline on the client.
+      return;
+    }
+
+    // This is a valid new call attempt.
+    console.log(`📞 Relaying NEW call offer from ${socket.id} to ${targetId}`);
+    activeCalls[socket.id] = targetId;
+    activeCalls[targetId] = socket.id;
+
+    io.to(targetId).emit("call:incoming", {
+      from: { id: socket.id, name: caller.name },
+      offer,
+    });
   });
 
   socket.on("call:answer", ({ targetId, answer }) => {
-    // ✅ FIX: Validate that the sender is actually in a call with the target
+    // Validate that the sender is actually in a call with the target
     if (activeCalls[socket.id] !== targetId) {
-      console.log(`⚠️ Invalid call answer from ${socket.id} to ${targetId}`);
+      console.log(
+        `⚠️ Invalid call answer from ${socket.id} to ${targetId}. No active call found.`
+      );
       return;
     }
     console.log(`✅ Relaying call answer from ${socket.id} to ${targetId}`);
@@ -438,11 +479,14 @@ io.on("connection", (socket) => {
   });
 
   socket.on("call:ice_candidate", ({ targetId, candidate }) => {
-    // ✅ FIX: Validate that the sender is actually in a call with the target
+    // Validate that the sender is actually in a call with the target
     if (activeCalls[socket.id] !== targetId) {
-      console.log(`⚠️ Invalid ICE candidate from ${socket.id} to ${targetId}`);
+      console.log(
+        `⚠️ Invalid ICE candidate from ${socket.id} to ${targetId}. No active call found.`
+      );
       return;
     }
+    // No console log here to prevent flooding the server logs.
     io.to(targetId).emit("call:ice_candidate_received", {
       from: socket.id,
       candidate,
@@ -455,7 +499,7 @@ io.on("connection", (socket) => {
       from: { id: socket.id, name: users[socket.id]?.name || "User" },
       reason,
     });
-    // Clean up the call state
+    // Clean up the call state for both users
     delete activeCalls[socket.id];
     delete activeCalls[targetId];
   });
