@@ -9,7 +9,8 @@ const app = express();
 const server = http.createServer(app);
 
 // --- CORS Configuration ---
-// CRITICAL: This origin URL MUST EXACTLY MATCH your Vercel frontend URL.
+// For development, you might use "*". For production, it's best to restrict
+// this to your actual frontend URL for security.
 const corsOptions = {
   origin: "https://anonymous-chat-frontend-gray.vercel.app",
   methods: ["GET", "POST"],
