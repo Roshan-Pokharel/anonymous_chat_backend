@@ -12,7 +12,7 @@ const server = http.createServer(app);
 // For development, you might use "*". For production, it's best to restrict
 // this to your actual frontend URL for security.
 const corsOptions = {
-  origin: "https://anonymous-chat-frontend-gray.vercel.app",
+  origin: "*", // Using "*" for broad compatibility, but restrict in production
   methods: ["GET", "POST"],
 };
 
@@ -416,22 +416,33 @@ io.on("connection", (socket) => {
     const caller = users[socket.id];
     console.log(`📞 Relaying call offer from ${socket.id} to ${targetId}`);
     if (caller && users[targetId]) {
+      // Set up the call relationship
+      activeCalls[socket.id] = targetId;
+      activeCalls[targetId] = socket.id;
+
       io.to(targetId).emit("call:incoming", {
         from: { id: socket.id, name: caller.name },
         offer,
       });
-      activeCalls[socket.id] = targetId;
-      activeCalls[targetId] = socket.id;
     }
   });
 
   socket.on("call:answer", ({ targetId, answer }) => {
+    // ✅ FIX: Validate that the sender is actually in a call with the target
+    if (activeCalls[socket.id] !== targetId) {
+      console.log(`⚠️ Invalid call answer from ${socket.id} to ${targetId}`);
+      return;
+    }
     console.log(`✅ Relaying call answer from ${socket.id} to ${targetId}`);
     io.to(targetId).emit("call:answer_received", { from: socket.id, answer });
   });
 
   socket.on("call:ice_candidate", ({ targetId, candidate }) => {
-    // console.log(`🧊 Relaying ICE candidate from ${socket.id} to ${targetId}`); // This can be very noisy
+    // ✅ FIX: Validate that the sender is actually in a call with the target
+    if (activeCalls[socket.id] !== targetId) {
+      console.log(`⚠️ Invalid ICE candidate from ${socket.id} to ${targetId}`);
+      return;
+    }
     io.to(targetId).emit("call:ice_candidate_received", {
       from: socket.id,
       candidate,
@@ -440,18 +451,28 @@ io.on("connection", (socket) => {
 
   socket.on("call:decline", ({ targetId, reason }) => {
     console.log(`❌ Relaying call decline from ${socket.id} to ${targetId}`);
-    io.to(targetId).emit("call:declined", { from: { id: socket.id }, reason });
+    io.to(targetId).emit("call:declined", {
+      from: { id: socket.id, name: users[socket.id]?.name || "User" },
+      reason,
+    });
+    // Clean up the call state
     delete activeCalls[socket.id];
     delete activeCalls[targetId];
   });
 
-  socket.on("call:end", ({ targetId }) => {
-    console.log(`☎️ Relaying call end from ${socket.id} to ${targetId}`);
-    if (users[targetId]) {
-      io.to(targetId).emit("call:ended", { from: socket.id });
+  socket.on("call:end", () => {
+    const partnerId = activeCalls[socket.id];
+    console.log(
+      `☎️ Relaying call end from ${socket.id} to partner ${partnerId}`
+    );
+    if (partnerId && users[partnerId]) {
+      io.to(partnerId).emit("call:ended", { from: socket.id });
     }
+    // Clean up the call state for both users
     delete activeCalls[socket.id];
-    delete activeCalls[targetId];
+    if (partnerId) {
+      delete activeCalls[partnerId];
+    }
   });
 
   // --- GAME EVENTS ---
@@ -678,6 +699,7 @@ io.on("connection", (socket) => {
     }
     declinedPairsToRemove.forEach((pair) => declinedChats.delete(pair));
 
+    // Handle call cleanup on disconnect
     const otherUserId = activeCalls[socket.id];
     if (otherUserId) {
       io.to(otherUserId).emit("call:ended", { from: socket.id });
