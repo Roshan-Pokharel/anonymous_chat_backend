@@ -467,7 +467,6 @@ io.on("connection", (socket) => {
     activeGameRooms[roomId] = newRoom;
     socket.join(roomId);
     socket.emit("game:joined", newRoom);
-    io.emit("game:roomsList", getPublicRoomList());
     io.to(roomId).emit("game:state", {
       gameType: newRoom.gameType,
       players: newRoom.players,
